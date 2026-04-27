@@ -64,6 +64,8 @@ The generator uses public metadata and reference pages:
 
 The generated HTML embeds the fetched point data at build time. Online map tiles and CDN libraries are loaded by the browser when the dashboard is opened.
 
+Third-party map tiles, atlas metadata, public datasets, and external libraries remain subject to their respective licenses and terms of use.
+
 ## Project Structure
 
 ```text
