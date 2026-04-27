@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+
+.idea/
+.vscode/
+
+edge-cdp-profile*/
+energy-map-*.png
+
+.DS_Store
+Thumbs.db

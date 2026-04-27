@@ -1,0 +1,5163 @@
+from __future__ import annotations
+
+"""Generate a professional, local HTML energy-resource suitability map.
+
+This script is intentionally self-contained: it fetches public metadata from
+official map services when network access is available, enriches point features
+with public Wikipedia API coordinates/summaries, and then writes one HTML file
+that can be opened directly from the local folder.
+
+The generated page is a screening and visualization prototype, not a reserve
+estimate or engineering design tool. Wind and solar are represented with
+client-rendered continuous suitability heatmaps referenced to public atlas
+metadata; the underlying ArcGIS ImageServer tiles are LERC rasters, which normal
+browser image tags cannot display directly. Coal, oil, gas, geothermal, and
+hydropower are represented with exact reference points and callout labels
+because their public global datasets are more heterogeneous and are better
+introduced as province/project anchors.
+"""
+
+import datetime as dt
+import html
+import json
+import re
+import textwrap
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+OUTPUT_HTML = ROOT / "energy_suitability_map.html"
+
+# Public APIs often rate-limit anonymous calls. A descriptive user agent makes
+# the script easier to identify in server logs and is friendlier than Python's
+# default urllib user agent.
+USER_AGENT = (
+    "EnergySuitabilityMapGenerator/1.0 "
+    "(local research prototype; contact: local-user)"
+)
+
+# ArcGIS Living Atlas items used for true continuous raster overlays. The
+# generator asks ArcGIS for the current service URL so future service migrations
+# do not require editing the HTML template. The fallback URL keeps the local
+# generator usable if metadata lookup fails but the service itself is unchanged.
+ARCGIS_ITEMS = {
+    "wind": {
+        "id": "991a2c6c974140108dc05ecc1a4007f1",
+        "fallback_url": "https://tiledimageservices.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/global_wind_atlas_power_density/ImageServer",
+        "label": "Global Wind Atlas - Wind Power Density",
+        "unit": "W/m2",
+        "fallback_max_level": 8,
+    },
+    "solar": {
+        "id": "cfad47ae14114784b8d47da3b03b3620",
+        "fallback_url": "https://tiledimageservices.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/GSA_PVOUT/ImageServer",
+        "label": "Global Solar Atlas - PV Power Potential",
+        "unit": "kWh/kWp",
+        "fallback_max_level": 6,
+    },
+}
+
+
+# Each ResourcePoint starts with a conservative fallback coordinate and a human
+# curated interpretation of why the location is useful for early-stage energy
+# screening. During generation, fetch_wikipedia_point() attempts to replace the
+# fallback coordinate with the public coordinate exposed by the Wikipedia API.
+@dataclass
+class ResourcePoint:
+    energy: str
+    name: str
+    label: str
+    wiki_title: str
+    lat: float
+    lon: float
+    region: str
+    metric: str
+    drivers: str
+    offset: tuple[int, int]
+    source_url: str = ""
+    source_title: str = ""
+    summary: str = ""
+    fetched: bool = False
+
+
+# Curated seed points. The goal is not to list every deposit/project; it is to
+# provide enough well-known anchors for an analyst to understand how each energy
+# type maps to geology, terrain, infrastructure, and resource quality.
+RESOURCE_POINTS: list[ResourcePoint] = [
+    ResourcePoint(
+        "coal",
+        "Powder River Basin",
+        "Powder River Basin",
+        "Powder River Basin",
+        43.7,
+        -106.6,
+        "United States",
+        "Large low-sulfur coal basin",
+        "Thick shallow coal seams, surface mining access and rail export corridors.",
+        (96, -38),
+    ),
+    ResourcePoint(
+        "coal",
+        "Appalachian Coalfields",
+        "Appalachian coal",
+        "Appalachian Plateau",
+        38.8,
+        -81.6,
+        "United States",
+        "Historic bituminous coal belt",
+        "Pennsylvanian coal measures, dense transport network and legacy mines.",
+        (86, -34),
+    ),
+    ResourcePoint(
+        "coal",
+        "Kuznetsk Basin",
+        "Kuzbass",
+        "Kuznetsk Basin",
+        54.2,
+        86.2,
+        "Russia",
+        "Major hard-coal basin",
+        "Continuous coal-bearing basin with rail links to industrial and export markets.",
+        (86, -35),
+    ),
+    ResourcePoint(
+        "coal",
+        "Ordos Basin",
+        "Ordos coal",
+        "Ordos Basin",
+        38.6,
+        109.8,
+        "China",
+        "Coal, gas and energy-chemical cluster",
+        "Large inland sedimentary basin with coal seams and integrated power demand.",
+        (88, -30),
+    ),
+    ResourcePoint(
+        "coal",
+        "Bowen Basin",
+        "Bowen Basin",
+        "Bowen Basin",
+        -23.5,
+        148.0,
+        "Australia",
+        "Coking and thermal coal basin",
+        "Permian coal measures, mine concentration and export rail-port infrastructure.",
+        (88, -38),
+    ),
+    ResourcePoint(
+        "coal",
+        "Damodar Valley Coalfields",
+        "Damodar coal",
+        "Damodar Valley",
+        23.7,
+        86.4,
+        "India",
+        "Dense eastern India coal belt",
+        "Coal-bearing Gondwana basins close to steel, power and rail demand.",
+        (88, 34),
+    ),
+    ResourcePoint(
+        "oil",
+        "Ghawar Field",
+        "Ghawar",
+        "Ghawar Field",
+        25.43,
+        49.62,
+        "Saudi Arabia",
+        "Supergiant conventional oil field",
+        "Carbonate reservoir, mature infrastructure and proximity to export systems.",
+        (92, -34),
+    ),
+    ResourcePoint(
+        "oil",
+        "Burgan Field",
+        "Burgan",
+        "Burgan field",
+        29.08,
+        47.98,
+        "Kuwait",
+        "Supergiant oil field",
+        "Large structural trap, high-quality reservoirs and dense upstream infrastructure.",
+        (92, 28),
+    ),
+    ResourcePoint(
+        "oil",
+        "Permian Basin",
+        "Permian Basin",
+        "Permian Basin (North America)",
+        31.8,
+        -103.1,
+        "United States",
+        "Tight oil and legacy conventional province",
+        "Stacked reservoirs, mature service sector and extensive gathering systems.",
+        (98, -38),
+    ),
+    ResourcePoint(
+        "oil",
+        "Western Siberian Basin",
+        "W. Siberia oil",
+        "West Siberian petroleum basin",
+        61.5,
+        75.0,
+        "Russia",
+        "World-scale petroleum basin",
+        "Large sedimentary basin with proven oil systems and export pipeline links.",
+        (102, -38),
+    ),
+    ResourcePoint(
+        "oil",
+        "Orinoco Belt",
+        "Orinoco Belt",
+        "Orinoco Belt",
+        8.3,
+        -64.0,
+        "Venezuela",
+        "Extra-heavy oil belt",
+        "Large in-place resource; development depends on upgrading, diluent and market access.",
+        (94, -32),
+    ),
+    ResourcePoint(
+        "oil",
+        "Tupi Field",
+        "Brazil pre-salt",
+        "Tupi oil field",
+        -25.5,
+        -42.9,
+        "Brazil",
+        "Deepwater pre-salt oil",
+        "High-productivity offshore reservoirs under salt, requiring advanced deepwater systems.",
+        (92, -36),
+    ),
+    ResourcePoint(
+        "oil",
+        "Niger Delta",
+        "Niger Delta",
+        "Niger Delta",
+        5.3,
+        6.4,
+        "Nigeria",
+        "Major deltaic oil province",
+        "Thick delta sediments, oil-prone systems and established export infrastructure.",
+        (86, -32),
+    ),
+    ResourcePoint(
+        "gas",
+        "North Field / South Pars",
+        "North Field",
+        "South Pars/North Dome Gas-Condensate field",
+        26.5,
+        51.0,
+        "Qatar / Iran",
+        "Giant offshore gas-condensate field",
+        "World-scale non-associated gas resource with LNG and pipeline export options.",
+        (98, -38),
+    ),
+    ResourcePoint(
+        "gas",
+        "Urengoy Field",
+        "Urengoy",
+        "Urengoy gas field",
+        66.0,
+        77.0,
+        "Russia",
+        "Giant conventional gas field",
+        "Large dry-gas reserves in a mature gas province with long-distance pipelines.",
+        (92, -34),
+    ),
+    ResourcePoint(
+        "gas",
+        "Marcellus Shale",
+        "Marcellus",
+        "Marcellus Formation",
+        41.0,
+        -77.7,
+        "United States",
+        "Major shale gas play",
+        "Organic-rich shale, horizontal drilling and proximity to northeastern demand.",
+        (92, -34),
+    ),
+    ResourcePoint(
+        "gas",
+        "Groningen Field",
+        "Groningen",
+        "Groningen gas field",
+        53.3,
+        6.8,
+        "Netherlands",
+        "Large depleted gas field",
+        "Classic onshore gas province; induced seismicity makes constraints central.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "gas",
+        "Gorgon Gas Project Area",
+        "Gorgon",
+        "Gorgon gas project",
+        -20.6,
+        115.5,
+        "Australia",
+        "Offshore gas and LNG hub",
+        "Large offshore gas fields linked to LNG export capacity.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "gas",
+        "Zohr Field",
+        "Zohr",
+        "Zohr gas field",
+        31.8,
+        32.3,
+        "Egypt",
+        "Giant Mediterranean gas field",
+        "Carbonate gas discovery close to regional infrastructure and demand centers.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "The Geysers",
+        "The Geysers",
+        "The Geysers",
+        38.78,
+        -122.75,
+        "United States",
+        "Large geothermal steam field",
+        "High heat flow, fractured reservoir and mature geothermal power operations.",
+        (98, -36),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Larderello",
+        "Larderello",
+        "Larderello",
+        43.24,
+        10.88,
+        "Italy",
+        "Historic geothermal field",
+        "High-temperature hydrothermal system in a tectonically active province.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Hellisheidi Power Station",
+        "Hellisheidi",
+        "Hellisheidi Power Station",
+        64.04,
+        -21.4,
+        "Iceland",
+        "Volcanic-zone geothermal plant",
+        "Mid-ocean-ridge volcanism, high heat flow and strong district-heating demand.",
+        (94, -34),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Olkaria Geothermal Field",
+        "Olkaria",
+        "Olkaria",
+        -0.9,
+        36.3,
+        "Kenya",
+        "East African Rift geothermal hub",
+        "Rift volcanism, permeable faults and growing regional power demand.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Cerro Prieto",
+        "Cerro Prieto",
+        "Cerro Prieto Geothermal Power Station",
+        32.42,
+        -115.25,
+        "Mexico",
+        "High-enthalpy geothermal complex",
+        "Pull-apart basin, shallow heat anomaly and long operating history.",
+        (98, -34),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Wayang Windu",
+        "Wayang Windu",
+        "Wayang Windu Geothermal Power Station",
+        -7.2,
+        107.6,
+        "Indonesia",
+        "Volcanic-arc geothermal resource",
+        "Arc volcanism, high-temperature reservoirs and grid-connected operations.",
+        (96, -36),
+    ),
+    ResourcePoint(
+        "geothermal",
+        "Wairakei",
+        "Wairakei",
+        "Wairakei Power Station",
+        -38.63,
+        176.08,
+        "New Zealand",
+        "Taupo volcanic-zone geothermal field",
+        "High heat flow, hydrothermal reservoirs and mature resource management.",
+        (86, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Three Gorges Dam",
+        "Three Gorges",
+        "Three Gorges Dam",
+        30.823,
+        111.003,
+        "China",
+        "Large reservoir hydropower",
+        "High regulated flow, large head and strong grid integration on the Yangtze River.",
+        (96, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Itaipu Dam",
+        "Itaipu",
+        "Itaipu Dam",
+        -25.408,
+        -54.588,
+        "Brazil / Paraguay",
+        "Major run-of-river / reservoir project",
+        "High river flow, cross-border power market and mature transmission systems.",
+        (86, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Guri Dam",
+        "Guri",
+        "Guri Dam",
+        7.765,
+        -62.998,
+        "Venezuela",
+        "Large tropical hydropower reservoir",
+        "High discharge basin and major grid role; drought sensitivity matters.",
+        (86, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Grand Coulee Dam",
+        "Grand Coulee",
+        "Grand Coulee Dam",
+        47.956,
+        -118.982,
+        "United States",
+        "Large Columbia River hydropower project",
+        "Large controlled river flow, existing grid and multipurpose water infrastructure.",
+        (100, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Tarbela Dam",
+        "Tarbela",
+        "Tarbela Dam",
+        34.088,
+        72.698,
+        "Pakistan",
+        "Indus basin hydropower and storage",
+        "Mountain-fed river, storage potential and irrigation-power integration.",
+        (88, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Inga Dams",
+        "Inga",
+        "Inga dams",
+        -5.52,
+        13.61,
+        "DR Congo",
+        "Very high river-flow hydropower site",
+        "Congo River discharge and falls create exceptional hydropower potential.",
+        (84, -34),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Belo Monte Dam",
+        "Belo Monte",
+        "Belo Monte Dam",
+        -3.126,
+        -51.774,
+        "Brazil",
+        "Amazon basin hydropower project",
+        "Large seasonal river flow with major ecological and social constraints.",
+        (92, -36),
+    ),
+    ResourcePoint(
+        "hydro",
+        "Gibe III Dam",
+        "Gibe III",
+        "Gilgel Gibe III Dam",
+        6.848,
+        37.301,
+        "Ethiopia",
+        "East African highland hydropower",
+        "Highland river gradient, storage and regional power-export potential.",
+        (86, -36),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Kashiwazaki-Kariwa Nuclear Power Plant",
+        "Kashiwazaki-Kariwa",
+        "Kashiwazaki-Kariwa Nuclear Power Plant",
+        37.43,
+        138.60,
+        "Japan",
+        "Large coastal nuclear generation site",
+        "Established multi-unit nuclear site with coastal cooling access and high-voltage grid integration.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Bruce Nuclear Generating Station",
+        "Bruce nuclear",
+        "Bruce Nuclear Generating Station",
+        44.33,
+        -81.59,
+        "Canada",
+        "Large CANDU nuclear complex",
+        "Major operating nuclear station on Lake Huron with cooling-water access and mature transmission links.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Zaporizhzhia Nuclear Power Plant",
+        "Zaporizhzhia",
+        "Zaporizhzhia Nuclear Power Plant",
+        47.51,
+        34.59,
+        "Ukraine",
+        "Large nuclear power station",
+        "Large reactor site with major grid role; security, cooling and geopolitical constraints are critical.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Barakah Nuclear Power Plant",
+        "Barakah",
+        "Barakah Nuclear Power Plant",
+        23.97,
+        52.23,
+        "United Arab Emirates",
+        "New-build coastal nuclear site",
+        "Recent multi-unit nuclear development with coastal cooling, grid integration and industrial demand context.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Taishan Nuclear Power Plant",
+        "Taishan nuclear",
+        "Taishan Nuclear Power Plant",
+        21.91,
+        112.98,
+        "China",
+        "Large coastal nuclear generation site",
+        "Coastal nuclear site serving dense load centers with established transmission and cooling-water access.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Kori Nuclear Power Plant",
+        "Kori nuclear",
+        "Kori Nuclear Power Plant",
+        35.32,
+        129.30,
+        "South Korea",
+        "Large coastal nuclear cluster",
+        "Established nuclear cluster near industrial demand, port infrastructure and coastal cooling resources.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Gravelines Nuclear Power Station",
+        "Gravelines",
+        "Gravelines Nuclear Power Station",
+        51.01,
+        2.14,
+        "France",
+        "Large coastal nuclear station",
+        "Multi-unit nuclear station with coastal cooling and strong connection to the French transmission system.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Olkiluoto Nuclear Power Plant",
+        "Olkiluoto",
+        "Olkiluoto Nuclear Power Plant",
+        61.24,
+        21.44,
+        "Finland",
+        "Coastal nuclear generation site",
+        "Nordic coastal nuclear site with grid integration and long-term waste-management infrastructure context.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Vogtle Electric Generating Plant",
+        "Vogtle",
+        "Vogtle Electric Generating Plant",
+        33.14,
+        -81.76,
+        "United States",
+        "Large nuclear generation site",
+        "Multi-unit nuclear station with recent new-build units, river cooling access and regional grid integration.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Hinkley Point C Nuclear Power Station",
+        "Hinkley Point C",
+        "Hinkley Point C nuclear power station",
+        51.21,
+        -3.13,
+        "United Kingdom",
+        "New-build coastal nuclear project",
+        "Coastal new-build nuclear project with transmission access, cooling-water access and major permitting history.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Kudankulam Nuclear Power Plant",
+        "Kudankulam",
+        "Kudankulam Nuclear Power Plant",
+        8.17,
+        77.71,
+        "India",
+        "Coastal nuclear generation site",
+        "Large coastal nuclear station supporting southern India demand with seawater cooling and grid access.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Angra Nuclear Power Plant",
+        "Angra",
+        "Angra Nuclear Power Plant",
+        -23.01,
+        -44.46,
+        "Brazil",
+        "Coastal nuclear generation site",
+        "Brazilian coastal nuclear site with cooling-water access and established grid connection.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Koeberg Nuclear Power Station",
+        "Koeberg",
+        "Koeberg Nuclear Power Station",
+        -33.68,
+        18.43,
+        "South Africa",
+        "Coastal nuclear generation site",
+        "Established coastal nuclear station near Cape Town with grid support role and seawater cooling.",
+        (104, -38),
+    ),
+    ResourcePoint(
+        "nuclear",
+        "Akkuyu Nuclear Power Plant",
+        "Akkuyu",
+        "Akkuyu Nuclear Power Plant",
+        36.14,
+        33.54,
+        "Turkey",
+        "New-build coastal nuclear site",
+        "Mediterranean coastal nuclear development with seawater cooling access and national grid integration plans.",
+        (104, -38),
+    ),
+]
+
+
+# Baseline English analytical copy. The HTML also contains a client-side
+# translation layer for UI labels and selected summaries; these English values
+# remain the canonical source because the scraped web metadata is English.
+ENERGY_INFO = {
+    "all": {
+        "name": "All resource markers",
+        "summary": "Comparable screening view for fossil basins, renewable candidate zones, nuclear sites, geothermal systems and major hydropower sites.",
+        "criteria": ["Resource intensity", "Geological or terrain setting", "Grid / export access", "Environmental and permitting constraints"],
+    },
+    "multi": {
+        "name": "Custom marker selection",
+        "summary": "User-selected combination of energy marker layers for cross-resource comparison. Heatmaps remain visible when wind or solar is part of the selected set.",
+        "criteria": ["Selected resource signal", "Infrastructure and grid access", "Terrain / geology or site setting", "Constraints and permitting risk"],
+    },
+    "coal": {
+        "name": "Coal",
+        "summary": "Sedimentary basins and coalfield clusters where coal-bearing strata, seam thickness and transport access create high early-stage suitability.",
+        "criteria": ["Coal measures and seam continuity", "Depth and stripping ratio", "Mine safety and groundwater conditions", "Rail, port and power demand access"],
+    },
+    "oil": {
+        "name": "Oil",
+        "summary": "Petroleum systems and producing provinces with proven source-reservoir-seal combinations and commercial infrastructure.",
+        "criteria": ["Source rock maturity", "Reservoir and trap quality", "Discovery density and field size", "Pipeline, port and refining access"],
+    },
+    "gas": {
+        "name": "Natural gas",
+        "summary": "Conventional and unconventional gas provinces where resource richness, reservoir deliverability and market access are decisive.",
+        "criteria": ["Gas saturation and pressure", "Reservoir permeability or stimulation potential", "Pipeline / LNG access", "Methane, water and community constraints"],
+    },
+    "wind": {
+        "name": "Wind power",
+        "summary": "Continuous wind suitability heatmap referenced to Global Wind Atlas metadata. Higher intensity indicates stronger wind resource potential.",
+        "criteria": ["Wind power density", "Turbulence and extreme wind", "Terrain roughness and wake effects", "Grid connection and protected-area exclusions"],
+    },
+    "solar": {
+        "name": "Solar PV",
+        "summary": "Continuous solar suitability heatmap referenced to Global Solar Atlas metadata. Higher intensity indicates greater PV yield potential.",
+        "criteria": ["PV power potential", "Irradiation and cloud cover", "Temperature derating and dust", "Land, water-cleaning and grid constraints"],
+    },
+    "geothermal": {
+        "name": "Geothermal",
+        "summary": "High-heat-flow volcanic, rift and tectonic systems where temperature, permeability and reinjection conditions support geothermal development.",
+        "criteria": ["Heat flow and reservoir temperature", "Fault permeability", "Drilling depth and fluid chemistry", "Induced seismicity and heat/power demand"],
+    },
+    "hydro": {
+        "name": "Hydropower",
+        "summary": "Major river sites representing high-flow or high-head hydropower potential. Suitability depends strongly on seasonal flow, geology and social impact.",
+        "criteria": ["River discharge and head", "Reservoir / regulation potential", "Dam-site geology and sediment", "Ecology, resettlement and transboundary water risk"],
+    },
+    "nuclear": {
+        "name": "Nuclear power",
+        "summary": "Existing and new-build nuclear generation sites that illustrate cooling-water access, grid integration, load-center proximity and licensing constraints.",
+        "criteria": ["Cooling-water access", "Grid capacity and load proximity", "Seismic, flooding and security constraints", "Licensing, waste and public-acceptance risk"],
+    },
+}
+
+
+# The template is a complete browser application. It intentionally uses CDN
+# Leaflet assets and public raster tile URLs so the generated HTML can be opened
+# directly from the local filesystem without running a web server. All dynamic
+# data is injected into APP_DATA near the bottom of the template.
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Global Energy Resource Suitability Map</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIINfQFzTO2c9B1yR0K6A5Wjdd0nWZ+8w0c="
+    crossorigin=""
+  />
+  <style>
+    :root {
+      --ink: #172322;
+      --muted: #5e6c6a;
+      --line: rgba(28, 42, 40, 0.16);
+      --panel: rgba(255, 255, 255, 0.92);
+      --panel-strong: #ffffff;
+      --map-ui: #f7f9f7;
+      --coal: #34393d;
+      --oil: #a95b2a;
+      --gas: #4c78a8;
+      --wind: #1e91a8;
+      --solar: #d59a19;
+      --geothermal: #c64b45;
+      --hydro: #2f7dbd;
+      --nuclear: #7a4fb0;
+      font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      color: var(--ink);
+      background: #dde6e2;
+    }
+
+    #map,
+    #globeScene {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #map {
+      background: #cfe6ec;
+      z-index: 0;
+      transition: opacity 180ms ease;
+    }
+
+    #globeScene {
+      z-index: 1;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 40% 38%, rgba(98, 154, 188, 0.34), transparent 34%),
+        linear-gradient(180deg, #07111b 0%, #102232 48%, #061018 100%);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 220ms ease;
+    }
+
+    body.globe-mode #map {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    body.globe-mode #globeScene {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    #globeCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .globe-line-layer,
+    .globe-marker-layer {
+      position: absolute;
+      inset: 0;
+      z-index: 4;
+      pointer-events: none;
+    }
+
+    .globe-line-layer line {
+      stroke-width: 1.4;
+      stroke-linecap: round;
+      opacity: 0.82;
+    }
+
+    body.globe-mode .html-line-layer,
+    body.globe-mode .html-marker-layer {
+      display: none;
+    }
+
+    .html-line-layer,
+    .html-marker-layer {
+      position: fixed;
+      inset: 0;
+      z-index: 450;
+      pointer-events: none;
+    }
+
+    .html-line-layer line {
+      stroke-width: 1.4;
+      stroke-linecap: round;
+      opacity: 0.82;
+    }
+
+    .html-resource-dot {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--color);
+      border: 2px solid white;
+      box-shadow: 0 0 0 2px rgba(23, 35, 34, 0.28), 0 6px 14px rgba(23, 35, 34, 0.24);
+      transform: translate(-50%, -50%);
+      pointer-events: auto;
+      cursor: pointer;
+      will-change: left, top;
+    }
+
+    .html-callout-label {
+      appearance: none;
+      display: block;
+      position: absolute;
+      width: 168px;
+      min-height: 48px;
+      padding: 7px 9px;
+      border: 1px solid rgba(23, 35, 34, 0.16);
+      border-left: 4px solid var(--color);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 9px 24px rgba(21, 32, 30, 0.16);
+      color: var(--ink);
+      font-size: 11px;
+      line-height: 1.22;
+      text-align: left;
+      transform: translate(0, -50%);
+      pointer-events: auto;
+      cursor: pointer;
+      will-change: left, top;
+    }
+
+    .html-callout-label b {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 12px;
+      line-height: 1.15;
+    }
+
+    .html-callout-label span {
+      color: var(--muted);
+      display: block;
+    }
+
+    .html-callout-label:hover,
+    .html-callout-label:focus-visible {
+      transform: translate(0, -50%);
+      outline: 2px solid rgba(30, 125, 118, 0.28);
+      outline-offset: 2px;
+    }
+
+    .resource-info-panel {
+      position: fixed;
+      z-index: 860;
+      width: min(430px, calc(100vw - 36px));
+      max-height: min(440px, calc(100vh - 36px));
+      overflow: auto;
+      padding: 18px 18px 16px;
+      border: 1px solid rgba(255, 255, 255, 0.54);
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.46));
+      backdrop-filter: blur(22px) saturate(1.3);
+      -webkit-backdrop-filter: blur(22px) saturate(1.3);
+      box-shadow: 0 24px 70px rgba(7, 20, 19, 0.28);
+      color: var(--ink);
+    }
+
+    .resource-info-panel[hidden] {
+      display: none;
+    }
+
+    .resource-info-close {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 28px;
+      height: 28px;
+      min-height: 28px;
+      padding: 0;
+      justify-content: center;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.48);
+    }
+
+    html[dir="rtl"] .resource-info-close {
+      right: auto;
+      left: 10px;
+    }
+
+    .leaflet-pane,
+    .leaflet-tile,
+    .leaflet-marker-icon,
+    .leaflet-marker-shadow,
+    .leaflet-tile-container,
+    .leaflet-pane > svg,
+    .leaflet-pane > canvas,
+    .leaflet-zoom-box,
+    .leaflet-image-layer,
+    .leaflet-layer {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    .leaflet-container {
+      overflow: hidden;
+      touch-action: pan-x pan-y;
+    }
+
+    .leaflet-tile,
+    .leaflet-marker-icon,
+    .leaflet-marker-shadow {
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    .leaflet-safari .leaflet-tile {
+      image-rendering: -webkit-optimize-contrast;
+    }
+
+    .leaflet-tile-pane { z-index: 200; }
+    .leaflet-overlay-pane { z-index: 400; }
+    .leaflet-shadow-pane { z-index: 500; }
+    .leaflet-marker-pane { z-index: 600; }
+    .leaflet-tooltip-pane { z-index: 650; }
+    .leaflet-popup-pane { z-index: 700; }
+    .leaflet-control { position: relative; z-index: 800; pointer-events: auto; }
+    .leaflet-top,
+    .leaflet-bottom { position: absolute; z-index: 1000; pointer-events: none; }
+    .leaflet-top { top: 0; }
+    .leaflet-right { right: 0; }
+    .leaflet-bottom { bottom: 0; }
+    .leaflet-left { left: 0; }
+    .leaflet-control { float: left; clear: both; }
+    .leaflet-right .leaflet-control { float: right; }
+    .leaflet-top .leaflet-control { margin-top: 10px; }
+    .leaflet-bottom .leaflet-control { margin-bottom: 10px; }
+    .leaflet-left .leaflet-control { margin-left: 10px; }
+    .leaflet-right .leaflet-control { margin-right: 10px; }
+    .leaflet-control-zoom-in,
+    .leaflet-control-zoom-out {
+      display: block;
+      width: 30px;
+      height: 30px;
+      line-height: 30px;
+      text-align: center;
+      text-decoration: none;
+      background: white;
+      border-bottom: 1px solid rgba(23, 35, 34, 0.14);
+    }
+
+    .leaflet-container {
+      font-family: inherit;
+      background: #cfe6ec;
+    }
+
+    .leaflet-tile {
+      opacity: 1 !important;
+    }
+
+    .leaflet-control-zoom a {
+      color: #263230;
+    }
+
+    .app-shell {
+      pointer-events: none;
+      position: fixed;
+      inset: 0;
+      z-index: 500;
+      display: grid;
+      grid-template-columns: minmax(340px, 420px) 1fr;
+      gap: 14px;
+      padding: 14px;
+      transition: grid-template-columns 180ms ease, padding-left 180ms ease;
+    }
+
+    body.sidebar-collapsed .app-shell {
+      grid-template-columns: 0 1fr;
+      padding-left: 0;
+    }
+
+    html[dir="rtl"] body.sidebar-collapsed .app-shell {
+      padding-right: 0;
+      padding-left: 14px;
+    }
+
+    .sidebar,
+    .top-tools,
+    .legend,
+    .statusbar {
+      pointer-events: auto;
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 45px rgba(21, 32, 30, 0.16);
+      border-radius: 8px;
+    }
+
+    .sidebar {
+      min-height: 0;
+      max-height: calc(100vh - 28px);
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      transition: transform 180ms ease, opacity 180ms ease;
+      will-change: transform;
+    }
+
+    body.sidebar-collapsed .sidebar {
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(calc(-100% - 24px));
+    }
+
+    html[dir="rtl"] body.sidebar-collapsed .sidebar {
+      transform: translateX(calc(100% + 24px));
+    }
+
+    .sidebar-toggle {
+      position: fixed;
+      top: 50%;
+      left: 434px;
+      z-index: 720;
+      width: 32px;
+      height: 74px;
+      min-height: 74px;
+      padding: 0;
+      border-radius: 0 8px 8px 0;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 12px 30px rgba(21, 32, 30, 0.18);
+      transform: translateY(-50%);
+    }
+
+    .sidebar-toggle:hover,
+    .sidebar-toggle:focus-visible {
+      transform: translateY(-50%);
+    }
+
+    body.sidebar-collapsed .sidebar-toggle {
+      left: 0;
+    }
+
+    html[dir="rtl"] .sidebar-toggle {
+      right: 434px;
+      left: auto;
+      border-radius: 8px 0 0 8px;
+    }
+
+    html[dir="rtl"] body.sidebar-collapsed .sidebar-toggle {
+      right: 0;
+      left: auto;
+    }
+
+    .brand {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 255, 255, 0.76));
+    }
+
+    .brand-row {
+      display: grid;
+      grid-template-columns: 1fr;
+      align-items: start;
+      gap: 9px;
+      margin-bottom: 7px;
+    }
+
+    .language-control {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .marker-mode-control {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 12px 0;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      border-top: 1px solid rgba(28, 42, 40, 0.07);
+    }
+
+    .brand-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .map-style-control {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+      flex: 1 1 0;
+      justify-content: space-between;
+    }
+
+    .language-control {
+      flex: 1 1 0;
+      justify-content: space-between;
+    }
+
+    .map-style-control select,
+    .language-control select,
+    .marker-mode-control select {
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--ink);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 5px 28px 5px 9px;
+    }
+
+    .map-style-control select {
+      width: min(132px, 100%);
+      max-width: 132px;
+    }
+
+    .language-control select {
+      width: min(132px, 100%);
+      max-width: 132px;
+    }
+
+    .marker-mode-control select {
+      width: min(190px, 60%);
+      max-width: 190px;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 7px;
+    }
+
+    .brand-row .eyebrow {
+      margin-bottom: 0;
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #2e8b70;
+      box-shadow: 0 0 0 5px rgba(46, 139, 112, 0.12);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 23px;
+      line-height: 1.1;
+      letter-spacing: 0;
+      max-width: 100%;
+      overflow-wrap: break-word;
+    }
+
+    .subtitle {
+      margin: 9px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .mode-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    button {
+      appearance: none;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--ink);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 8px 10px;
+      transition: transform 150ms ease, background 150ms ease, border-color 150ms ease, color 150ms ease;
+    }
+
+    button:hover,
+    button:focus-visible {
+      transform: translateY(-1px);
+      border-color: rgba(23, 35, 34, 0.34);
+      outline: none;
+    }
+
+    button.active {
+      background: #172322;
+      border-color: #172322;
+      color: white;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--color);
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.76);
+      flex: 0 0 auto;
+    }
+
+    .active button .swatch {
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.28);
+    }
+
+    .layer-tools {
+      display: grid;
+      gap: 10px;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(247, 249, 247, 0.66);
+    }
+
+    .tool-row {
+      display: grid;
+      grid-template-columns: 92px 1fr 38px;
+      align-items: center;
+      gap: 9px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: #1e7d76;
+    }
+
+    .panel-main {
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+      display: grid;
+      gap: 13px;
+      grid-auto-rows: min-content;
+      align-content: start;
+    }
+
+    .section {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.72);
+      overflow: hidden;
+    }
+
+    details.section {
+      display: block;
+    }
+
+    details.section:not([open]) {
+      background: rgba(255, 255, 255, 0.82);
+    }
+
+    details.section > summary {
+      list-style: none;
+      min-height: 52px;
+      padding: 0;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    details.section > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .accordion-summary {
+      min-height: 52px;
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      border-bottom: 0;
+    }
+
+    details[open] .accordion-summary {
+      border-bottom: 1px solid var(--line);
+    }
+
+    .accordion-title {
+      min-width: 0;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .accordion-value {
+      min-width: 0;
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .accordion-chevron {
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: rgba(23, 35, 34, 0.06);
+      color: var(--muted);
+      font-size: 13px;
+      transition: transform 150ms ease;
+    }
+
+    details[open] .accordion-chevron {
+      transform: rotate(180deg);
+    }
+
+    .section-head {
+      padding: 12px 12px 9px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .mode-summary {
+      margin: 7px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      border-top: 1px solid var(--line);
+    }
+
+    .metric {
+      padding: 11px 10px;
+      border-right: 1px solid var(--line);
+    }
+
+    .metric:last-child { border-right: 0; }
+
+    .metric b {
+      display: block;
+      font-size: 20px;
+      line-height: 1;
+      margin-bottom: 4px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .criteria-list,
+    .source-list,
+    .point-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .criteria-list {
+      display: grid;
+      gap: 7px;
+      padding: 11px 12px 12px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.42;
+    }
+
+    .criteria-list li {
+      display: grid;
+      grid-template-columns: 8px 1fr;
+      gap: 8px;
+      align-items: start;
+    }
+
+    .criteria-list li::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      margin-top: 5px;
+      border-radius: 999px;
+      background: #2e8b70;
+    }
+
+    .point-list {
+      max-height: 315px;
+      overflow: auto;
+    }
+
+    .point-item {
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      transition: background 150ms ease;
+    }
+
+    .point-item:last-child { border-bottom: 0; }
+
+    .point-item:hover,
+    .point-item.active {
+      background: rgba(30, 125, 118, 0.08);
+    }
+
+    .point-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .point-meta,
+    .point-drivers {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.38;
+    }
+
+    .badge {
+      min-height: 20px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: rgba(23, 35, 34, 0.08);
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .model-controls {
+      display: grid;
+      gap: 10px;
+      padding: 11px 12px 12px;
+    }
+
+    .weight-row {
+      display: grid;
+      grid-template-columns: 104px 1fr 42px;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .weight-row output {
+      color: var(--ink);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .model-note,
+    .quality-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .candidate-list,
+    .quality-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-height: 335px;
+      overflow: auto;
+    }
+
+    .candidate-item {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      transition: background 150ms ease;
+    }
+
+    .candidate-item:hover {
+      background: rgba(30, 125, 118, 0.08);
+    }
+
+    .candidate-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .score-pill {
+      min-width: 44px;
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: rgba(30, 125, 118, 0.13);
+      color: #145f5a;
+      font-size: 10px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .score-bar {
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(23, 35, 34, 0.08);
+      overflow: hidden;
+    }
+
+    .score-bar span {
+      display: block;
+      height: 100%;
+      width: var(--score);
+      border-radius: inherit;
+      background: linear-gradient(90deg, #1e91a8, #2e8b70, #e0a928);
+    }
+
+    .candidate-meta,
+    .component-row,
+    .quality-row {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .component-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 5px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .quality-row {
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .quality-row:last-child {
+      border-bottom: 0;
+    }
+
+    .export-actions {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+      padding: 11px 12px 12px;
+      border-top: 1px solid var(--line);
+    }
+
+    .export-actions button {
+      min-height: 32px;
+      justify-content: center;
+      padding: 6px 8px;
+      font-size: 11px;
+    }
+
+    .footer {
+      display: grid;
+      gap: 8px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+      background: rgba(247, 249, 247, 0.74);
+    }
+
+    .footer details {
+      border: 1px solid rgba(23, 35, 34, 0.1);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.62);
+      overflow: hidden;
+    }
+
+    .footer summary {
+      list-style: none;
+      min-height: 34px;
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 800;
+      user-select: none;
+    }
+
+    .footer summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .footer details[open] summary {
+      border-bottom: 1px solid rgba(23, 35, 34, 0.1);
+    }
+
+    .footer-description,
+    .generated-line {
+      margin: 0;
+      padding: 9px 10px;
+    }
+
+    .footer .source-list {
+      padding: 0 10px 10px;
+    }
+
+    .footer-compact {
+      max-width: 185px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .source-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    a {
+      color: #216a89;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    .floating {
+      pointer-events: none;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .top-tools {
+      pointer-events: auto;
+      position: fixed;
+      top: 18px;
+      left: 50%;
+      z-index: 640;
+      width: min(560px, calc(100vw - 48px));
+      min-height: 54px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      transform: translateX(-50%);
+    }
+
+    body.sidebar-collapsed .top-tools {
+      width: min(560px, calc(100vw - 48px));
+    }
+
+    .search-title {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .search-title strong {
+      font-size: 14px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .search-title span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .view-actions {
+      display: flex;
+      gap: 7px;
+    }
+
+    .icon-button {
+      width: auto;
+      min-width: 48px;
+      height: 34px;
+      min-height: 34px;
+      border-radius: 8px;
+      padding: 0 10px;
+      justify-content: center;
+      font-size: 11px;
+    }
+
+    .icon-button.active {
+      border-color: rgba(30, 125, 118, 0.42);
+      background: rgba(30, 125, 118, 0.12);
+      color: #145f5a;
+    }
+
+    .bottom-stack {
+      pointer-events: none;
+      align-self: end;
+      justify-self: end;
+      display: grid;
+      gap: 10px;
+      width: min(430px, calc(100vw - 470px));
+    }
+
+    body.sidebar-collapsed .bottom-stack {
+      width: min(430px, calc(100vw - 92px));
+    }
+
+    .legend {
+      pointer-events: auto;
+      padding: 12px 14px;
+      display: grid;
+      gap: 9px;
+    }
+
+    .legend h3 {
+      margin-bottom: 2px;
+    }
+
+    .gradient {
+      height: 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(23, 35, 34, 0.14);
+      background: linear-gradient(90deg, rgba(49, 46, 129, 0.10), rgba(14, 165, 233, 0.50), rgba(34, 197, 94, 0.62), rgba(250, 204, 21, 0.74), rgba(249, 115, 22, 0.82), rgba(220, 38, 38, 0.90));
+    }
+
+    .legend-row,
+    .legend-scale {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .legend-scale {
+      justify-content: space-between;
+    }
+
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--dot);
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.82), 0 0 0 3px rgba(23, 35, 34, 0.14);
+      flex: 0 0 auto;
+    }
+
+    .statusbar {
+      pointer-events: auto;
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 12px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .zoom-slider-control {
+      position: fixed;
+      right: 18px;
+      top: 50%;
+      z-index: 610;
+      width: 42px;
+      min-height: 246px;
+      padding: 12px 8px;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      justify-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 18px 45px rgba(21, 32, 30, 0.16);
+      transform: translateY(-50%);
+      pointer-events: auto;
+    }
+
+    html[dir="rtl"] .zoom-slider-control {
+      right: auto;
+      left: 18px;
+    }
+
+    .zoom-slider-control input[type="range"] {
+      width: 24px;
+      height: 210px;
+      writing-mode: vertical-lr;
+      direction: rtl;
+      -webkit-appearance: slider-vertical;
+      accent-color: #1e7d76;
+    }
+
+    .zoom-slider-value {
+      min-width: 24px;
+      min-height: 24px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      background: rgba(23, 35, 34, 0.08);
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .callout-label {
+      min-width: 118px;
+      max-width: 185px;
+      padding: 7px 9px;
+      border: 1px solid rgba(23, 35, 34, 0.16);
+      border-left: 4px solid var(--color);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: 0 9px 24px rgba(21, 32, 30, 0.16);
+      color: var(--ink);
+      font-size: 11px;
+      line-height: 1.22;
+      white-space: normal;
+    }
+
+    .callout-label b {
+      display: block;
+      margin-bottom: 2px;
+      font-size: 12px;
+      line-height: 1.15;
+    }
+
+    .callout-label span {
+      color: var(--muted);
+      display: block;
+    }
+
+    .resource-dot {
+      width: 12px;
+      height: 12px;
+      margin: -6px 0 0 -6px;
+      border-radius: 999px;
+      background: var(--color);
+      border: 2px solid white;
+      box-shadow: 0 0 0 2px rgba(23, 35, 34, 0.28), 0 6px 14px rgba(23, 35, 34, 0.24);
+    }
+
+    .popup-anchor {
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .leaflet-popup-content-wrapper {
+      border: 1px solid rgba(255, 255, 255, 0.56);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.62);
+      backdrop-filter: blur(18px) saturate(1.25);
+      -webkit-backdrop-filter: blur(18px) saturate(1.25);
+      box-shadow: 0 22px 62px rgba(7, 20, 19, 0.24);
+    }
+
+    .leaflet-popup-tip {
+      background: rgba(255, 255, 255, 0.62);
+      backdrop-filter: blur(18px) saturate(1.25);
+      -webkit-backdrop-filter: blur(18px) saturate(1.25);
+    }
+
+    .leaflet-popup-content {
+      min-width: 250px;
+      margin: 13px 14px;
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .popup-title {
+      font-size: 14px;
+      font-weight: 800;
+      margin-bottom: 4px;
+    }
+
+    .popup-meta {
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .popup-grid {
+      display: grid;
+      gap: 6px;
+      padding-top: 7px;
+      border-top: 1px solid rgba(23, 35, 34, 0.12);
+    }
+
+    .popup-grid b {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #374543;
+    }
+
+    @media (max-width: 980px) {
+      html,
+      body {
+        overflow: auto;
+        height: auto;
+      }
+
+      #map {
+        position: relative;
+        height: 68vh;
+        min-height: 520px;
+      }
+
+      #globeScene {
+        position: relative;
+        height: 68vh;
+        min-height: 520px;
+      }
+
+      .app-shell {
+        position: relative;
+        inset: auto;
+        z-index: 1;
+        grid-template-columns: 1fr;
+        padding: 10px;
+      }
+
+      body.sidebar-collapsed .app-shell {
+        grid-template-columns: 1fr;
+        padding-left: 10px;
+      }
+
+      .sidebar {
+        max-height: none;
+      }
+
+      body.sidebar-collapsed .sidebar {
+        opacity: 1;
+        pointer-events: auto;
+        transform: none;
+      }
+
+      .floating {
+        display: none;
+      }
+
+      .sidebar-toggle,
+      .zoom-slider-control {
+        display: none;
+      }
+
+      .html-line-layer,
+      .html-marker-layer {
+        display: none;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .mode-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .tool-row {
+        grid-template-columns: 72px 1fr 36px;
+      }
+
+      .brand-row,
+      .brand-controls {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="globeScene" class="globe-scene" aria-hidden="true">
+    <canvas id="globeCanvas"></canvas>
+    <svg id="globeLineLayer" class="globe-line-layer" aria-hidden="true"></svg>
+    <div id="globeMarkerLayer" class="globe-marker-layer" aria-hidden="true"></div>
+  </div>
+  <svg id="htmlLineLayer" class="html-line-layer" aria-hidden="true"></svg>
+  <div id="htmlMarkerLayer" class="html-marker-layer" aria-hidden="true"></div>
+  <div id="resourceInfoPanel" class="resource-info-panel" hidden></div>
+  <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Hide sidebar" aria-expanded="true">&lt;</button>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="brand-row">
+          <div class="eyebrow"><span class="pulse"></span><span id="brandKicker">Energy GIS Screening</span></div>
+          <div class="brand-controls">
+            <label class="map-style-control" for="mapStyleSelect">
+              <span id="mapStyleLabel">Map style</span>
+              <select id="mapStyleSelect" aria-label="Map style">
+                <option value="flat" selected>Flat map</option>
+                <option value="globe">3D globe</option>
+              </select>
+            </label>
+            <label class="language-control" for="languageSelect">
+              <span id="languageLabel">Language</span>
+              <select id="languageSelect" aria-label="Language">
+                <option value="en" selected>English</option>
+                <option value="zh">中文</option>
+                <option value="es">Español</option>
+                <option value="hi">हिन्दी</option>
+                <option value="ar">العربية</option>
+                <option value="fr">Français</option>
+                <option value="pt">Português</option>
+                <option value="ru">Русский</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <h1 id="appTitle">Global Energy Resource Suitability Map</h1>
+      </header>
+
+      <label class="marker-mode-control" for="markerModeSelect">
+        <span id="markerModeLabel">Marker mode</span>
+        <select id="markerModeSelect" aria-label="Marker mode">
+          <option value="all" selected>All markers</option>
+          <option value="single">Single marker</option>
+          <option value="multi">Multi-select markers</option>
+        </select>
+      </label>
+
+      <nav class="mode-grid" aria-label="Energy layer selector" id="modeGrid">
+        <button data-mode="wind"><span class="swatch" style="--color:var(--wind)"></span><span data-mode-label="wind">Wind heatmap</span></button>
+        <button data-mode="solar"><span class="swatch" style="--color:var(--solar)"></span><span data-mode-label="solar">Solar heatmap</span></button>
+        <button data-mode="coal"><span class="swatch" style="--color:var(--coal)"></span><span data-mode-label="coal">Coal</span></button>
+        <button data-mode="oil"><span class="swatch" style="--color:var(--oil)"></span><span data-mode-label="oil">Oil</span></button>
+        <button data-mode="gas"><span class="swatch" style="--color:var(--gas)"></span><span data-mode-label="gas">Natural gas</span></button>
+        <button data-mode="geothermal"><span class="swatch" style="--color:var(--geothermal)"></span><span data-mode-label="geothermal">Geothermal</span></button>
+        <button data-mode="hydro"><span class="swatch" style="--color:var(--hydro)"></span><span data-mode-label="hydro">Hydropower</span></button>
+        <button data-mode="nuclear"><span class="swatch" style="--color:var(--nuclear)"></span><span data-mode-label="nuclear">Nuclear power</span></button>
+      </nav>
+
+      <div class="panel-main">
+        <details class="section accordion" id="criteriaPanel">
+          <summary>
+            <div class="accordion-summary">
+              <span class="accordion-title" id="criteriaPanelTitle">Screening criteria</span>
+              <span class="accordion-value" id="criteriaPanelValue">4 factors</span>
+              <span class="accordion-chevron">v</span>
+            </div>
+          </summary>
+          <ul id="criteriaList" class="criteria-list"></ul>
+        </details>
+
+        <details class="section accordion" id="pointsPanel">
+          <summary>
+            <div class="accordion-summary">
+              <span class="accordion-title" id="pointsPanelTitle">Resource reference points</span>
+              <span class="accordion-value" id="pointsPanelValue">0 points</span>
+              <span class="accordion-chevron">v</span>
+            </div>
+          </summary>
+          <ul id="pointList" class="point-list"></ul>
+        </details>
+
+        <details class="section accordion" id="modelPanel" open>
+          <summary>
+            <div class="accordion-summary">
+              <span class="accordion-title" id="modelPanelTitle">Screening model</span>
+              <span class="accordion-value" id="modelPanelValue">4 weights</span>
+              <span class="accordion-chevron">v</span>
+            </div>
+          </summary>
+          <div class="model-controls" id="weightControls">
+            <label class="weight-row">
+              <span id="resourceWeightLabel">Resource</span>
+              <input type="range" min="0" max="100" value="45" data-weight="resource" />
+              <output id="resourceWeightValue">45%</output>
+            </label>
+            <label class="weight-row">
+              <span id="infrastructureWeightLabel">Access</span>
+              <input type="range" min="0" max="100" value="20" data-weight="infrastructure" />
+              <output id="infrastructureWeightValue">20%</output>
+            </label>
+            <label class="weight-row">
+              <span id="terrainWeightLabel">Terrain</span>
+              <input type="range" min="0" max="100" value="20" data-weight="terrain" />
+              <output id="terrainWeightValue">20%</output>
+            </label>
+            <label class="weight-row">
+              <span id="constraintWeightLabel">Constraints</span>
+              <input type="range" min="0" max="100" value="15" data-weight="constraint" />
+              <output id="constraintWeightValue">15%</output>
+            </label>
+            <p class="model-note" id="modelNote">Weighted early-stage score for comparing candidate regions. It is a screening index, not a feasibility study.</p>
+          </div>
+        </details>
+
+        <details class="section accordion" id="shortlistPanel" open>
+          <summary>
+            <div class="accordion-summary">
+              <span class="accordion-title" id="shortlistPanelTitle">Candidate shortlist</span>
+              <span class="accordion-value" id="shortlistPanelValue">0 ranked</span>
+              <span class="accordion-chevron">v</span>
+            </div>
+          </summary>
+          <ol id="candidateList" class="candidate-list"></ol>
+        </details>
+
+        <details class="section accordion" id="evidencePanel">
+          <summary>
+            <div class="accordion-summary">
+              <span class="accordion-title" id="evidencePanelTitle">Data quality and export</span>
+              <span class="accordion-value" id="evidencePanelValue">screening-grade</span>
+              <span class="accordion-chevron">v</span>
+            </div>
+          </summary>
+          <ul id="qualityList" class="quality-list"></ul>
+          <div class="export-actions">
+            <button type="button" id="exportCsv">CSV</button>
+            <button type="button" id="exportGeojson">GeoJSON</button>
+            <button type="button" id="exportReport">Report</button>
+          </div>
+        </details>
+      </div>
+
+      <footer class="footer">
+        <details>
+          <summary>
+            <span id="aboutFooterTitle">About this map</span>
+            <span></span>
+            <span class="accordion-chevron">v</span>
+          </summary>
+          <p class="footer-description" id="appSubtitle">Generated from public web data and official atlas metadata. Marker layers show reference resource provinces and projects; wind and solar use continuous suitability heatmaps.</p>
+        </details>
+        <details>
+          <summary>
+            <span id="sourcesFooterTitle">Sources</span>
+            <span class="footer-compact" id="generatedBrief"></span>
+            <span class="accordion-chevron">v</span>
+          </summary>
+          <div class="generated-line"><span id="generatedLabel">Generated</span>: <span id="generatedAt"></span></div>
+          <ul id="sourceList" class="source-list"></ul>
+        </details>
+      </footer>
+    </aside>
+
+    <section class="floating">
+      <div class="top-tools">
+        <div class="search-title">
+          <strong id="floatingTitle">Global energy resource view</strong>
+          <span id="floatingSubtitle">Detailed global basemap with public resource overlays</span>
+        </div>
+        <div class="view-actions">
+          <button class="icon-button" id="resetView" title="Reset world view" aria-label="Reset world view">Home</button>
+          <button class="icon-button" id="labelToggle" title="Hide all labels" aria-label="Hide all labels">Hide labels</button>
+        </div>
+      </div>
+
+      <div></div>
+
+      <div class="bottom-stack">
+        <div class="legend">
+          <h3 id="legendTitle">Legend</h3>
+          <div class="gradient"></div>
+          <div class="legend-scale"><span id="lowerRasterLabel">Lower raster value</span><span id="higherRasterLabel">Higher raster value</span></div>
+          <div class="legend-row"><span class="legend-dot" style="--dot:var(--coal)"></span><span id="markerLegendLabel">Coal / oil / gas / geothermal / hydropower / nuclear resource markers</span></div>
+          <div class="legend-row"><span class="legend-dot" style="--dot:var(--wind)"></span><span id="rasterLegendLabel">Wind and solar use continuous suitability heatmaps referenced to public atlas metadata</span></div>
+        </div>
+        <div class="statusbar">
+          <span id="cursorPosition">Lat -, Lon -</span>
+          <span id="activeSource">Source: mixed public data</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="zoom-slider-control" aria-label="Map zoom slider">
+    <input id="zoomSlider" type="range" min="2" max="13" step="0.01" value="3" aria-label="Map zoom" />
+    <span id="zoomSliderValue" class="zoom-slider-value">3</span>
+  </div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin="">
+  </script>
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script>
+    const APP_DATA = __APP_DATA__;
+
+    const ENERGY_COLORS = {
+      coal: "#34393d",
+      oil: "#a95b2a",
+      gas: "#4c78a8",
+      wind: "#1e91a8",
+      solar: "#d59a19",
+      geothermal: "#c64b45",
+      hydro: "#2f7dbd",
+      nuclear: "#7a4fb0",
+      all: "#172322"
+    };
+
+    const UI_TEXT = {
+      en: {
+        lang: "en",
+        dir: "ltr",
+        brandKicker: "Energy GIS Screening",
+        language: "Language",
+        mapStyle: "Map style",
+        flatMap: "Flat map",
+        globeMap: "3D globe",
+        appTitle: "Global Energy Resource Suitability Map",
+        appSubtitle: "Generated from public web data and official atlas metadata. Marker layers show reference resource provinces and projects; wind and solar use continuous suitability heatmaps.",
+        screeningCriteria: "Screening criteria",
+        resourcePoints: "Resource reference points",
+        markerMode: "Marker mode",
+        markerModeAll: "All markers",
+        markerModeSingle: "Single marker",
+        markerModeMulti: "Multi-select markers",
+        visibleMarkers: "Visible markers",
+        webFetched: "Web-fetched points",
+        mapZoom: "Map zoom",
+        activeRaster: "Active raster layer",
+        activeMarker: "Active marker layer",
+        publicMarkers: "Public point references with source-linked metadata",
+        generated: "Generated",
+        legend: "Legend",
+        lowerRaster: "Lower raster value",
+        higherRaster: "Higher raster value",
+        markerLegend: "Coal / oil / gas / geothermal / hydropower / nuclear resource markers",
+        rasterLegend: "Wind and solar use continuous suitability heatmaps referenced to public atlas metadata",
+        source: "Source",
+        sourceMixed: "mixed public data",
+        sourcePublic: "public reference pages",
+        sourcePage: "Source page",
+        sourceSummary: "Source summary",
+        resourceBrief: "Resource brief",
+        resourceSignal: "Resource signal",
+        suitabilityDrivers: "Suitability drivers",
+        resetView: "Home",
+        hideLabels: "Hide labels",
+        showLabels: "Show labels",
+        resetTitle: "Reset world view",
+        hideLabelsTitle: "Hide all labels and keep point markers visible",
+        showLabelsTitle: "Show labels and leader lines",
+        aboutMap: "About this map",
+        sources: "Sources",
+        hideSidebar: "Hide sidebar",
+        showSidebar: "Show sidebar",
+        zoomSlider: "Map zoom",
+        close: "Close",
+        fallbackCoordinates: "Fallback coordinates",
+        lowerPointCount: "points",
+        factorCount: "factors",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      zh: {
+        lang: "zh-CN",
+        dir: "ltr",
+        brandKicker: "能源 GIS 筛选",
+        language: "语言",
+        mapStyle: "地图样式",
+        flatMap: "平面地图",
+        globeMap: "3D 地球",
+        appTitle: "全球能源资源适宜性地图",
+        appSubtitle: "基于公开网络数据和官方图谱元数据生成。点位图层展示资源省区和项目锚点；风电与光伏使用连续适宜性热力图。",
+        screeningCriteria: "筛选条件",
+        resourcePoints: "资源参考点",
+        markerMode: "标记方式",
+        markerModeAll: "全部标记",
+        markerModeSingle: "单独标记",
+        markerModeMulti: "任意多选标记",
+        visibleMarkers: "可见标记",
+        webFetched: "网络抓取点位",
+        mapZoom: "地图缩放",
+        activeRaster: "当前栅格图层",
+        activeMarker: "当前标记图层",
+        publicMarkers: "带来源链接的公开点位参考数据",
+        generated: "生成时间",
+        legend: "图例",
+        lowerRaster: "较低栅格值",
+        higherRaster: "较高栅格值",
+        markerLegend: "煤炭 / 石油 / 天然气 / 地热 / 水电 / 核能资源标记",
+        rasterLegend: "风电和光伏使用连续适宜性热力图，并参考公开图谱元数据",
+        source: "来源",
+        sourceMixed: "混合公开数据",
+        sourcePublic: "公开参考页面",
+        sourcePage: "来源页面",
+        sourceSummary: "来源摘要",
+        resourceBrief: "资源点简介",
+        resourceSignal: "资源信号",
+        suitabilityDrivers: "适宜性驱动因素",
+        resetView: "复位",
+        fitLayer: "适配",
+        resetTitle: "重置全球视图",
+        fitTitle: "适配当前图层",
+        close: "关闭",
+        lowerPointCount: "个点位",
+        factorCount: "项因素",
+        lat: "纬度",
+        lon: "经度"
+      },
+      es: {
+        lang: "es",
+        dir: "ltr",
+        brandKicker: "Cribado GIS energético",
+        language: "Idioma",
+        mapStyle: "Estilo",
+        flatMap: "Mapa plano",
+        globeMap: "Globo 3D",
+        appTitle: "Mapa global de idoneidad de recursos energéticos",
+        appSubtitle: "Generado con datos web públicos y metadatos de atlas oficiales. Los marcadores muestran provincias y proyectos; eólica y solar usan mapas de calor continuos.",
+        screeningCriteria: "Criterios de cribado",
+        resourcePoints: "Puntos de referencia",
+        visibleMarkers: "Marcadores visibles",
+        webFetched: "Puntos obtenidos",
+        mapZoom: "Zoom del mapa",
+        activeRaster: "Capa ráster activa",
+        activeMarker: "Capa de marcadores activa",
+        publicMarkers: "Referencias públicas con metadatos enlazados",
+        generated: "Generado",
+        legend: "Leyenda",
+        lowerRaster: "Valor ráster bajo",
+        higherRaster: "Valor ráster alto",
+        markerLegend: "Marcadores de carbón / petróleo / gas / geotermia / hidro",
+        rasterLegend: "Eólica y solar usan mapas de calor continuos referenciados a atlas públicos",
+        source: "Fuente",
+        sourceMixed: "datos públicos mixtos",
+        sourcePublic: "páginas públicas de referencia",
+        sourcePage: "Página fuente",
+        sourceSummary: "Resumen fuente",
+        resourceBrief: "Resumen del recurso",
+        resourceSignal: "Señal del recurso",
+        suitabilityDrivers: "Factores de idoneidad",
+        resetView: "Inicio",
+        fitLayer: "Ajustar",
+        resetTitle: "Restablecer vista mundial",
+        fitTitle: "Ajustar capa activa",
+        close: "Cerrar",
+        lowerPointCount: "puntos",
+        factorCount: "factores",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      hi: {
+        lang: "hi",
+        dir: "ltr",
+        brandKicker: "ऊर्जा GIS स्क्रीनिंग",
+        language: "भाषा",
+        mapStyle: "मानचित्र शैली",
+        flatMap: "समतल मानचित्र",
+        globeMap: "3D ग्लोब",
+        appTitle: "वैश्विक ऊर्जा संसाधन उपयुक्तता मानचित्र",
+        appSubtitle: "सार्वजनिक वेब डेटा और आधिकारिक एटलस मेटाडेटा से बनाया गया। मार्कर संसाधन क्षेत्रों और परियोजनाओं को दिखाते हैं; पवन और सौर निरंतर उपयुक्तता हीटमैप उपयोग करते हैं।",
+        screeningCriteria: "स्क्रीनिंग मानदंड",
+        resourcePoints: "संसाधन संदर्भ बिंदु",
+        visibleMarkers: "दृश्यमान मार्कर",
+        webFetched: "वेब से मिले बिंदु",
+        mapZoom: "मैप जूम",
+        activeRaster: "सक्रिय रास्टर लेयर",
+        activeMarker: "सक्रिय मार्कर लेयर",
+        publicMarkers: "स्रोत-लिंक वाले सार्वजनिक बिंदु संदर्भ",
+        generated: "बनाया गया",
+        legend: "लीजेंड",
+        lowerRaster: "कम रास्टर मान",
+        higherRaster: "अधिक रास्टर मान",
+        markerLegend: "कोयला / तेल / गैस / भू-तापीय / जलविद्युत मार्कर",
+        rasterLegend: "पवन और सौर सार्वजनिक एटलस मेटाडेटा पर आधारित निरंतर हीटमैप उपयोग करते हैं",
+        source: "स्रोत",
+        sourceMixed: "मिश्रित सार्वजनिक डेटा",
+        sourcePublic: "सार्वजनिक संदर्भ पेज",
+        sourcePage: "स्रोत पेज",
+        sourceSummary: "स्रोत सारांश",
+        resourceBrief: "संसाधन परिचय",
+        resourceSignal: "संसाधन संकेत",
+        suitabilityDrivers: "उपयुक्तता कारक",
+        resetView: "होम",
+        fitLayer: "फिट",
+        resetTitle: "विश्व दृश्य रीसेट करें",
+        fitTitle: "सक्रिय लेयर फिट करें",
+        close: "बंद करें",
+        lowerPointCount: "बिंदु",
+        factorCount: "कारक",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      ar: {
+        lang: "ar",
+        dir: "rtl",
+        brandKicker: "فرز الطاقة بنظم GIS",
+        language: "اللغة",
+        mapStyle: "نمط الخريطة",
+        flatMap: "خريطة مسطحة",
+        globeMap: "كرة أرضية 3D",
+        appTitle: "خريطة ملاءمة موارد الطاقة العالمية",
+        appSubtitle: "تم إنشاؤها من بيانات ويب عامة وبيانات وصفية لأطالس رسمية. تعرض العلامات أقاليم ومشروعات مرجعية، وتستخدم الرياح والشمس خرائط ملاءمة حرارية مستمرة.",
+        screeningCriteria: "معايير الفرز",
+        resourcePoints: "نقاط مرجعية للموارد",
+        visibleMarkers: "علامات ظاهرة",
+        webFetched: "نقاط من الويب",
+        mapZoom: "تكبير الخريطة",
+        activeRaster: "طبقة راستر نشطة",
+        activeMarker: "طبقة علامات نشطة",
+        publicMarkers: "مراجع نقاط عامة مع بيانات مصدر",
+        generated: "تاريخ الإنشاء",
+        legend: "المفتاح",
+        lowerRaster: "قيمة راستر أقل",
+        higherRaster: "قيمة راستر أعلى",
+        markerLegend: "علامات الفحم / النفط / الغاز / الحرارة الأرضية / الكهرومائية",
+        rasterLegend: "تستخدم الرياح والشمس خرائط ملاءمة حرارية مستمرة مستندة إلى بيانات أطلس عامة",
+        source: "المصدر",
+        sourceMixed: "بيانات عامة مختلطة",
+        sourcePublic: "صفحات مرجعية عامة",
+        sourcePage: "صفحة المصدر",
+        sourceSummary: "ملخص المصدر",
+        resourceBrief: "نبذة عن المورد",
+        resourceSignal: "إشارة المورد",
+        suitabilityDrivers: "عوامل الملاءمة",
+        resetView: "الرئيسية",
+        fitLayer: "ملاءمة",
+        resetTitle: "إعادة ضبط عرض العالم",
+        fitTitle: "ملاءمة الطبقة النشطة",
+        close: "إغلاق",
+        lowerPointCount: "نقاط",
+        factorCount: "عوامل",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      fr: {
+        lang: "fr",
+        dir: "ltr",
+        brandKicker: "Analyse SIG énergie",
+        language: "Langue",
+        mapStyle: "Style",
+        flatMap: "Carte plane",
+        globeMap: "Globe 3D",
+        appTitle: "Carte mondiale d'aptitude des ressources énergétiques",
+        appSubtitle: "Générée avec des données publiques et des métadonnées d'atlas officiels. Les marqueurs montrent des provinces et projets; l'éolien et le solaire utilisent des cartes de chaleur continues.",
+        screeningCriteria: "Critères d'analyse",
+        resourcePoints: "Points de référence",
+        visibleMarkers: "Marqueurs visibles",
+        webFetched: "Points web",
+        mapZoom: "Zoom carte",
+        activeRaster: "Couche raster active",
+        activeMarker: "Couche de marqueurs active",
+        publicMarkers: "Références publiques avec métadonnées liées",
+        generated: "Généré",
+        legend: "Légende",
+        lowerRaster: "Valeur raster faible",
+        higherRaster: "Valeur raster élevée",
+        markerLegend: "Marqueurs charbon / pétrole / gaz / géothermie / hydro",
+        rasterLegend: "Éolien et solaire utilisent des cartes de chaleur continues référencées aux atlas publics",
+        source: "Source",
+        sourceMixed: "données publiques mixtes",
+        sourcePublic: "pages publiques de référence",
+        sourcePage: "Page source",
+        sourceSummary: "Résumé source",
+        resourceBrief: "Résumé de la ressource",
+        resourceSignal: "Signal de ressource",
+        suitabilityDrivers: "Facteurs d'aptitude",
+        resetView: "Accueil",
+        fitLayer: "Ajuster",
+        resetTitle: "Réinitialiser la vue mondiale",
+        fitTitle: "Ajuster la couche active",
+        close: "Fermer",
+        lowerPointCount: "points",
+        factorCount: "facteurs",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      pt: {
+        lang: "pt",
+        dir: "ltr",
+        brandKicker: "Triagem GIS de energia",
+        language: "Idioma",
+        mapStyle: "Estilo",
+        flatMap: "Mapa plano",
+        globeMap: "Globo 3D",
+        appTitle: "Mapa global de adequação de recursos energéticos",
+        appSubtitle: "Gerado com dados públicos e metadados oficiais de atlas. Marcadores mostram províncias e projetos; vento e solar usam mapas de calor contínuos.",
+        screeningCriteria: "Critérios de triagem",
+        resourcePoints: "Pontos de referência",
+        visibleMarkers: "Marcadores visíveis",
+        webFetched: "Pontos coletados",
+        mapZoom: "Zoom do mapa",
+        activeRaster: "Camada raster ativa",
+        activeMarker: "Camada de marcadores ativa",
+        publicMarkers: "Referências públicas com metadados vinculados",
+        generated: "Gerado",
+        legend: "Legenda",
+        lowerRaster: "Valor raster menor",
+        higherRaster: "Valor raster maior",
+        markerLegend: "Marcadores de carvão / petróleo / gás / geotermia / hidro",
+        rasterLegend: "Eólico e solar usam mapas de calor contínuos referenciados a atlas públicos",
+        source: "Fonte",
+        sourceMixed: "dados públicos mistos",
+        sourcePublic: "páginas públicas de referência",
+        sourcePage: "Página fonte",
+        sourceSummary: "Resumo da fonte",
+        resourceBrief: "Resumo do recurso",
+        resourceSignal: "Sinal do recurso",
+        suitabilityDrivers: "Fatores de adequação",
+        resetView: "Início",
+        fitLayer: "Ajustar",
+        resetTitle: "Redefinir visão mundial",
+        fitTitle: "Ajustar camada ativa",
+        close: "Fechar",
+        lowerPointCount: "pontos",
+        factorCount: "fatores",
+        lat: "Lat",
+        lon: "Lon"
+      },
+      ru: {
+        lang: "ru",
+        dir: "ltr",
+        brandKicker: "GIS-оценка энергетики",
+        language: "Язык",
+        mapStyle: "Стиль",
+        flatMap: "Плоская карта",
+        globeMap: "3D-глобус",
+        appTitle: "Глобальная карта пригодности энергетических ресурсов",
+        appSubtitle: "Создано по открытым веб-данным и официальным метаданным атласов. Маркеры показывают ресурсные районы и проекты; ветер и солнце используют непрерывные тепловые карты пригодности.",
+        screeningCriteria: "Критерии отбора",
+        resourcePoints: "Опорные точки ресурсов",
+        visibleMarkers: "Видимые маркеры",
+        webFetched: "Точки из веба",
+        mapZoom: "Масштаб карты",
+        activeRaster: "Активный растровый слой",
+        activeMarker: "Активный слой маркеров",
+        publicMarkers: "Открытые точки со ссылками на источники",
+        generated: "Создано",
+        legend: "Легенда",
+        lowerRaster: "Низкое значение растра",
+        higherRaster: "Высокое значение растра",
+        markerLegend: "Маркеры угля / нефти / газа / геотермии / ГЭС",
+        rasterLegend: "Ветер и солнце используют непрерывные тепловые карты по открытым атласным метаданным",
+        source: "Источник",
+        sourceMixed: "смешанные открытые данные",
+        sourcePublic: "открытые справочные страницы",
+        sourcePage: "Страница источника",
+        sourceSummary: "Сводка источника",
+        resourceBrief: "Краткое описание ресурса",
+        resourceSignal: "Ресурсный сигнал",
+        suitabilityDrivers: "Факторы пригодности",
+        resetView: "Домой",
+        fitLayer: "Подогнать",
+        resetTitle: "Сбросить вид мира",
+        fitTitle: "Подогнать активный слой",
+        close: "Закрыть",
+        lowerPointCount: "точек",
+        factorCount: "факторов",
+        lat: "Lat",
+        lon: "Lon"
+      }
+    };
+
+    const LABEL_TOGGLE_TEXT = {
+      en: {
+        hide: "Hide labels",
+        show: "Show labels",
+        hideTitle: "Hide all labels and keep point markers visible",
+        showTitle: "Show labels and leader lines"
+      },
+      zh: {
+        hide: "隐藏标签",
+        show: "显示标签",
+        hideTitle: "隐藏所有标签，仅保留资源点",
+        showTitle: "显示标签和引导线"
+      },
+      es: {
+        hide: "Ocultar etiquetas",
+        show: "Mostrar etiquetas",
+        hideTitle: "Ocultar etiquetas y mantener puntos visibles",
+        showTitle: "Mostrar etiquetas y líneas guía"
+      },
+      hi: {
+        hide: "लेबल छिपाएँ",
+        show: "लेबल दिखाएँ",
+        hideTitle: "सभी लेबल छिपाएँ और बिंदु रखें",
+        showTitle: "लेबल और मार्गदर्शक रेखाएँ दिखाएँ"
+      },
+      ar: {
+        hide: "إخفاء التسميات",
+        show: "إظهار التسميات",
+        hideTitle: "إخفاء كل التسميات والإبقاء على النقاط",
+        showTitle: "إظهار التسميات وخطوط الإرشاد"
+      },
+      fr: {
+        hide: "Masquer libellés",
+        show: "Afficher libellés",
+        hideTitle: "Masquer tous les libellés et garder les points",
+        showTitle: "Afficher les libellés et traits de liaison"
+      },
+      pt: {
+        hide: "Ocultar rótulos",
+        show: "Mostrar rótulos",
+        hideTitle: "Ocultar rótulos e manter pontos visíveis",
+        showTitle: "Mostrar rótulos e linhas guia"
+      },
+      ru: {
+        hide: "Скрыть подписи",
+        show: "Показать подписи",
+        hideTitle: "Скрыть подписи и оставить точки",
+        showTitle: "Показать подписи и линии"
+      }
+    };
+
+    // Text used only by the professional screening panels. It is kept separate
+    // from the general UI translation table so model terminology can evolve
+    // without touching map controls, legend labels, or annotation strings.
+    const SCREENING_TEXT = {
+      en: {
+        modelTitle: "Screening model",
+        modelValue: "4 weights",
+        shortlistTitle: "Candidate shortlist",
+        shortlistValue: "ranked",
+        evidenceTitle: "Data quality and export",
+        evidenceValue: "screening-grade",
+        resource: "Resource",
+        infrastructure: "Access",
+        terrain: "Terrain",
+        constraint: "Constraints",
+        modelNote: "Weighted early-stage score for comparing candidate regions. It is a screening index, not a feasibility study.",
+        rankMeta: "Weighted score based on resource signal, access, terrain/geology and constraints",
+        dataQuality: "Public screening dataset. Use for consultation shortlisting; verify with licensed GIS layers before investment or engineering decisions.",
+        exportReport: "Report",
+        score: "Score"
+      },
+      zh: {
+        modelTitle: "初筛模型",
+        modelValue: "4 项权重",
+        shortlistTitle: "候选区短名单",
+        shortlistValue: "已排序",
+        evidenceTitle: "数据质量与导出",
+        evidenceValue: "初筛级",
+        resource: "资源",
+        infrastructure: "接入",
+        terrain: "地形",
+        constraint: "约束",
+        modelNote: "用于前期咨询对比候选区域的加权初筛分数，不等同于可研或工程设计结论。",
+        rankMeta: "加权分数基于资源信号、接入条件、地形/地质和约束风险",
+        dataQuality: "公开初筛数据集。适合咨询短名单；投资或工程决策前需用授权 GIS 数据复核。",
+        exportReport: "报告",
+        score: "分数"
+      }
+    };
+
+    // Wind and solar use continuous suitability surfaces rather than discrete
+    // resource points. These seed centroids turn the raster surface into a
+    // practical shortlist for early consulting conversations. In a production
+    // GIS deployment this array is the natural place to swap in polygons,
+    // licensed project pipelines, substations, or grid-connection candidate
+    // zones while preserving the same scoring and export contract.
+    const SCREENING_SEEDS = {
+      wind: [
+        ["North Sea offshore wind corridor", 55.5, 4.5, "North Sea", "High offshore wind resource and mature grid-port supply chain"],
+        ["US Great Plains wind belt", 39.5, -101.5, "United States", "Large onshore wind corridor with transmission buildout potential"],
+        ["Patagonia wind corridor", -45.0, -69.0, "Argentina / Chile", "Exceptional wind exposure with remote-grid constraints"],
+        ["Gobi / Inner Asia wind belt", 43.5, 104.0, "Mongolia / China", "Continental wind resource with long-distance transmission needs"],
+        ["Horn of Africa wind corridor", 8.5, 45.0, "Somalia / Ethiopia", "Strong regional winds and early-stage grid constraints"],
+        ["Southern Australia wind belt", -33.0, 137.0, "Australia", "Good wind resource near mining and port infrastructure"],
+        ["Atacama coastal wind corridor", -25.0, -70.0, "Chile", "Coastal wind and mining demand with desert permitting issues"],
+        ["Morocco Atlantic wind belt", 28.5, -13.0, "Morocco / Western Sahara", "Trade-wind resource with export and grid potential"]
+      ],
+      solar: [
+        ["Sahara solar belt", 24.0, 13.0, "North Africa", "Very high irradiation with water, grid and permitting constraints"],
+        ["Arabian Peninsula solar belt", 24.0, 45.0, "Saudi Arabia / UAE", "High PV yield near industrial demand and grid nodes"],
+        ["Atacama solar belt", -23.5, -69.0, "Chile", "Exceptional irradiation and mining demand"],
+        ["Australian Outback PV belt", -25.0, 134.0, "Australia", "High solar resource with distance-to-grid tradeoffs"],
+        ["US Southwest solar belt", 34.0, -113.0, "United States", "Strong resource and developed transmission market"],
+        ["Namib / Kalahari solar belt", -23.0, 18.0, "Namibia / Botswana", "High irradiation with export infrastructure questions"],
+        ["Rajasthan / Thar solar belt", 27.0, 72.0, "India", "High resource near fast-growing demand"],
+        ["Tibetan Plateau solar belt", 30.0, 88.0, "China", "High-altitude resource with grid and terrain constraints"]
+      ]
+    };
+
+    // Reuse the wind/solar shortlist seeds as visible map annotations. These
+    // are not project-specific survey points; they are representative candidate
+    // centroids that make the heatmap actionable in the same way as the fossil,
+    // geothermal, and hydro reference markers.
+    const RASTER_POINT_OFFSETS = [
+      [104, -42],
+      [104, -38],
+      [96, -44],
+      [96, -36],
+      [98, -40],
+      [94, -44],
+      [96, -38],
+      [100, -42]
+    ];
+
+    function rasterReferenceFeature(kind, seed, index) {
+      const [name, lat, lon, region, note] = seed;
+      const layer = APP_DATA.layers[kind] || {};
+      const metric = kind === "solar" ? "Solar PV suitability candidate zone" : "Wind suitability candidate zone";
+      return {
+        energy: kind,
+        name,
+        label: name,
+        lat,
+        lon,
+        region,
+        metric,
+        drivers: note,
+        summary: `${note}. Candidate centroid derived from the ${layer.label || kind} screening surface for early-stage comparison.`,
+        source_url: layer.itemUrl || "",
+        source_title: layer.label || kind,
+        offset: RASTER_POINT_OFFSETS[index % RASTER_POINT_OFFSETS.length],
+        rasterCandidate: true
+      };
+    }
+
+    const RASTER_REFERENCE_POINTS = {
+      wind: SCREENING_SEEDS.wind.map((seed, index) => rasterReferenceFeature("wind", seed, index)),
+      solar: SCREENING_SEEDS.solar.map((seed, index) => rasterReferenceFeature("solar", seed, index))
+    };
+
+    const MODE_LABELS = {
+      en: { all: "All markers", multi: "Multi-select markers", wind: "Wind heatmap", solar: "Solar heatmap", coal: "Coal", oil: "Oil", gas: "Natural gas", geothermal: "Geothermal", hydro: "Hydropower", nuclear: "Nuclear power" },
+      zh: { all: "全部标记", multi: "任意多选标记", wind: "风电热力图", solar: "光伏热力图", coal: "煤炭", oil: "石油", gas: "天然气", geothermal: "地热", hydro: "水电", nuclear: "核能" },
+      es: { all: "Todos los marcadores", multi: "Selección múltiple", wind: "Mapa eólico", solar: "Mapa solar", coal: "Carbón", oil: "Petróleo", gas: "Gas natural", geothermal: "Geotermia", hydro: "Hidroeléctrica", nuclear: "Nuclear" },
+      hi: { all: "सभी मार्कर", multi: "बहु-चयन मार्कर", wind: "पवन हीटमैप", solar: "सौर हीटमैप", coal: "कोयला", oil: "तेल", gas: "प्राकृतिक गैस", geothermal: "भू-तापीय", hydro: "जलविद्युत", nuclear: "परमाणु ऊर्जा" },
+      ar: { all: "كل العلامات", multi: "تحديد متعدد", wind: "خريطة الرياح", solar: "خريطة الشمس", coal: "الفحم", oil: "النفط", gas: "الغاز الطبيعي", geothermal: "الحرارة الأرضية", hydro: "الكهرومائية", nuclear: "الطاقة النووية" },
+      fr: { all: "Tous les marqueurs", multi: "Sélection multiple", wind: "Carte éolienne", solar: "Carte solaire", coal: "Charbon", oil: "Pétrole", gas: "Gaz naturel", geothermal: "Géothermie", hydro: "Hydroélectricité", nuclear: "Nucléaire" },
+      pt: { all: "Todos os marcadores", multi: "Seleção múltipla", wind: "Mapa eólico", solar: "Mapa solar", coal: "Carvão", oil: "Petróleo", gas: "Gás natural", geothermal: "Geotermia", hydro: "Hidrelétrica", nuclear: "Nuclear" },
+      ru: { all: "Все маркеры", multi: "Множественный выбор", wind: "Карта ветра", solar: "Карта солнца", coal: "Уголь", oil: "Нефть", gas: "Природный газ", geothermal: "Геотермия", hydro: "Гидроэнергия", nuclear: "Атомная энергетика" }
+    };
+
+    const ZH_REGION_TRANSLATIONS = {
+      "North Sea": "北海",
+      "Argentina / Chile": "阿根廷 / 智利",
+      "Mongolia / China": "蒙古 / 中国",
+      "Somalia / Ethiopia": "索马里 / 埃塞俄比亚",
+      "Morocco / Western Sahara": "摩洛哥 / 西撒哈拉",
+      "North Africa": "北非",
+      "Saudi Arabia / UAE": "沙特阿拉伯 / 阿联酋",
+      "Namibia / Botswana": "纳米比亚 / 博茨瓦纳",
+      "Japan": "日本",
+      "Canada": "加拿大",
+      "Ukraine": "乌克兰",
+      "United Arab Emirates": "阿联酋",
+      "South Korea": "韩国",
+      "France": "法国",
+      "Finland": "芬兰",
+      "United Kingdom": "英国",
+      "Turkey": "土耳其",
+      "United States": "美国",
+      "Russia": "俄罗斯",
+      "China": "中国",
+      "Australia": "澳大利亚",
+      "India": "印度",
+      "Saudi Arabia": "沙特阿拉伯",
+      "Kuwait": "科威特",
+      "Venezuela": "委内瑞拉",
+      "Brazil": "巴西",
+      "Nigeria": "尼日利亚",
+      "Qatar / Iran": "卡塔尔 / 伊朗",
+      "Netherlands": "荷兰",
+      "Egypt": "埃及",
+      "Italy": "意大利",
+      "Iceland": "冰岛",
+      "Kenya": "肯尼亚",
+      "Mexico": "墨西哥",
+      "Indonesia": "印度尼西亚",
+      "New Zealand": "新西兰",
+      "Brazil / Paraguay": "巴西 / 巴拉圭",
+      "Pakistan": "巴基斯坦",
+      "DR Congo": "刚果民主共和国",
+      "Ethiopia": "埃塞俄比亚"
+    };
+
+    const ZH_METRIC_TRANSLATIONS = {
+      "Wind suitability candidate zone": "风能适宜性候选区",
+      "Solar PV suitability candidate zone": "光伏适宜性候选区",
+      "Large coastal nuclear generation site": "大型滨海核电基地",
+      "Large CANDU nuclear complex": "大型 CANDU 核电综合体",
+      "Large nuclear power station": "大型核电站",
+      "New-build coastal nuclear site": "新建滨海核电基地",
+      "Large coastal nuclear cluster": "大型滨海核电集群",
+      "Large coastal nuclear station": "大型滨海核电站",
+      "Coastal nuclear generation site": "滨海核电基地",
+      "Large nuclear generation site": "大型核电基地",
+      "New-build coastal nuclear project": "新建滨海核电项目",
+      "Large low-sulfur coal basin": "大型低硫煤炭盆地",
+      "Historic bituminous coal belt": "历史悠久的烟煤带",
+      "Major hard-coal basin": "主要硬煤盆地",
+      "Coal, gas and energy-chemical cluster": "煤炭、天然气和能源化工集聚区",
+      "Coking and thermal coal basin": "炼焦煤和动力煤盆地",
+      "Dense eastern India coal belt": "印度东部密集煤田带",
+      "Supergiant conventional oil field": "超大型常规油田",
+      "Supergiant oil field": "超大型油田",
+      "Tight oil and legacy conventional province": "致密油与传统油气并存的成熟省区",
+      "World-scale petroleum basin": "世界级石油盆地",
+      "Extra-heavy oil belt": "超重油带",
+      "Deepwater pre-salt oil": "深水盐下油田",
+      "Major deltaic oil province": "主要三角洲油气省区",
+      "Giant offshore gas-condensate field": "大型海上凝析气田",
+      "Giant conventional gas field": "大型常规天然气田",
+      "Major shale gas play": "主要页岩气区",
+      "Large depleted gas field": "大型已衰减气田",
+      "Offshore gas and LNG hub": "海上天然气与 LNG 枢纽",
+      "Giant Mediterranean gas field": "地中海大型天然气田",
+      "Large geothermal steam field": "大型地热蒸汽田",
+      "Historic geothermal field": "历史悠久的地热田",
+      "Volcanic-zone geothermal plant": "火山区地热电站",
+      "East African Rift geothermal hub": "东非裂谷地热枢纽",
+      "High-enthalpy geothermal complex": "高焓地热综合体",
+      "Volcanic-arc geothermal resource": "火山弧地热资源",
+      "Taupo volcanic-zone geothermal field": "陶波火山区地热田",
+      "Large reservoir hydropower": "大型水库式水电站",
+      "Major run-of-river / reservoir project": "大型径流式 / 水库式水电项目",
+      "Large tropical hydropower reservoir": "大型热带水电水库",
+      "Large Columbia River hydropower project": "哥伦比亚河大型水电项目",
+      "Indus basin hydropower and storage": "印度河流域水电与调蓄工程",
+      "Very high river-flow hydropower site": "特高径流水电站址",
+      "Amazon basin hydropower project": "亚马孙流域水电项目",
+      "East African highland hydropower": "东非高原水电项目"
+    };
+
+    const ZH_DRIVER_TRANSLATIONS = {
+      "High offshore wind resource and mature grid-port supply chain": "海上风资源强，且具备较成熟的电网、港口和供应链条件。",
+      "Large onshore wind corridor with transmission buildout potential": "大型陆上风能走廊，具备输电扩建和规模化开发潜力。",
+      "Exceptional wind exposure with remote-grid constraints": "风暴露条件突出，但存在远离主网和接入成本约束。",
+      "Continental wind resource with long-distance transmission needs": "大陆性风资源较好，但通常需要长距离输电支撑。",
+      "Strong regional winds and early-stage grid constraints": "区域风能条件较强，但电网条件仍处于早期约束阶段。",
+      "Good wind resource near mining and port infrastructure": "风资源较好，靠近矿业负荷和港口基础设施。",
+      "Coastal wind and mining demand with desert permitting issues": "沿海风资源和矿业需求并存，但沙漠地区许可和环境约束需要复核。",
+      "Trade-wind resource with export and grid potential": "信风资源明显，具备出口和电网接入潜力。",
+      "Very high irradiation with water, grid and permitting constraints": "太阳辐照度很高，但水资源、电网和许可条件需要重点复核。",
+      "High PV yield near industrial demand and grid nodes": "光伏发电收益潜力高，且靠近工业负荷和电网节点。",
+      "Exceptional irradiation and mining demand": "太阳辐照条件突出，并存在矿业用电需求。",
+      "High solar resource with distance-to-grid tradeoffs": "太阳能资源强，但需要权衡距离电网较远带来的接入成本。",
+      "Strong resource and developed transmission market": "太阳能资源强，输电市场和项目开发环境相对成熟。",
+      "High irradiation with export infrastructure questions": "太阳辐照度高，但外送和出口基础设施条件需要进一步确认。",
+      "High resource near fast-growing demand": "太阳能资源较强，靠近快速增长的电力需求。",
+      "High-altitude resource with grid and terrain constraints": "高海拔太阳能资源较好，但电网接入和地形约束较明显。",
+      "Established multi-unit nuclear site with coastal cooling access and high-voltage grid integration.": "成熟的多机组核电基地，具备滨海冷却水条件和高压电网接入。",
+      "Major operating nuclear station on Lake Huron with cooling-water access and mature transmission links.": "休伦湖沿岸大型在运核电站，具备冷却水条件和成熟输电连接。",
+      "Large reactor site with major grid role; security, cooling and geopolitical constraints are critical.": "大型反应堆基地，对电网作用重要；安全、冷却和地缘政治约束需要重点复核。",
+      "Recent multi-unit nuclear development with coastal cooling, grid integration and industrial demand context.": "近年投运的多机组核电项目，具备滨海冷却、电网接入和工业负荷背景。",
+      "Coastal nuclear site serving dense load centers with established transmission and cooling-water access.": "服务密集负荷中心的滨海核电基地，具备既有输电和冷却水条件。",
+      "Established nuclear cluster near industrial demand, port infrastructure and coastal cooling resources.": "靠近工业需求、港口基础设施和滨海冷却资源的成熟核电集群。",
+      "Multi-unit nuclear station with coastal cooling and strong connection to the French transmission system.": "多机组滨海核电站，接入法国输电系统能力较强。",
+      "Nordic coastal nuclear site with grid integration and long-term waste-management infrastructure context.": "北欧滨海核电基地，具备电网接入和长期核废料管理基础设施背景。",
+      "Multi-unit nuclear station with recent new-build units, river cooling access and regional grid integration.": "多机组核电站，包含近年新建机组，具备河流冷却和区域电网接入。",
+      "Coastal new-build nuclear project with transmission access, cooling-water access and major permitting history.": "滨海新建核电项目，具备输电和冷却水条件，并有重要许可审批历史。",
+      "Large coastal nuclear station supporting southern India demand with seawater cooling and grid access.": "支撑印度南部需求的大型滨海核电站，具备海水冷却和电网接入。",
+      "Brazilian coastal nuclear site with cooling-water access and established grid connection.": "巴西滨海核电基地，具备冷却水条件和既有电网连接。",
+      "Established coastal nuclear station near Cape Town with grid support role and seawater cooling.": "靠近开普敦的成熟滨海核电站，具备电网支撑作用和海水冷却条件。",
+      "Mediterranean coastal nuclear development with seawater cooling access and national grid integration plans.": "地中海滨海核电开发项目，具备海水冷却条件和国家电网接入规划。",
+      "Thick shallow coal seams, surface mining access and rail export corridors.": "厚层浅埋煤层、露天开采条件和铁路外运通道。",
+      "Pennsylvanian coal measures, dense transport network and legacy mines.": "宾夕法尼亚纪煤系、密集交通网络和既有矿山基础。",
+      "Continuous coal-bearing basin with rail links to industrial and export markets.": "连续含煤盆地，并通过铁路连接工业和出口市场。",
+      "Large inland sedimentary basin with coal seams and integrated power demand.": "大型内陆沉积盆地，煤层资源与电力、煤化工需求高度耦合。",
+      "Permian coal measures, mine concentration and export rail-port infrastructure.": "二叠纪煤系、矿山集聚和铁路港口出口基础设施。",
+      "Coal-bearing Gondwana basins close to steel, power and rail demand.": "含煤冈瓦纳盆地，靠近钢铁、电力和铁路需求中心。",
+      "Carbonate reservoir, mature infrastructure and proximity to export systems.": "碳酸盐岩储层、成熟油气基础设施和出口系统邻近性。",
+      "Large structural trap, high-quality reservoirs and dense upstream infrastructure.": "大型构造圈闭、高质量储层和密集上游基础设施。",
+      "Stacked reservoirs, mature service sector and extensive gathering systems.": "多套叠置储层、成熟油服体系和广泛集输系统。",
+      "Large sedimentary basin with proven oil systems and export pipeline links.": "大型沉积盆地，已证实油气系统并具备出口管道联系。",
+      "Large in-place resource; development depends on upgrading, diluent and market access.": "原地资源规模大，开发取决于改质、稀释剂供应和市场通道。",
+      "High-productivity offshore reservoirs under salt, requiring advanced deepwater systems.": "盐下高产海上储层，开发需要先进深水工程系统。",
+      "Thick delta sediments, oil-prone systems and established export infrastructure.": "厚层三角洲沉积、富油系统和既有出口基础设施。",
+      "World-scale non-associated gas resource with LNG and pipeline export options.": "世界级非伴生气资源，具备 LNG 和管道出口选择。",
+      "Large dry-gas reserves in a mature gas province with long-distance pipelines.": "成熟天然气省区中的大型干气储量，并连接长输管道。",
+      "Organic-rich shale, horizontal drilling and proximity to northeastern demand.": "富有机质页岩、水平井技术和靠近美国东北部需求中心。",
+      "Classic onshore gas province; induced seismicity makes constraints central.": "典型陆上气田省区，但诱发地震使开发约束成为核心因素。",
+      "Large offshore gas fields linked to LNG export capacity.": "大型海上气田，并与 LNG 出口能力相连。",
+      "Carbonate gas discovery close to regional infrastructure and demand centers.": "碳酸盐岩气藏发现，靠近区域基础设施和需求中心。",
+      "High heat flow, fractured reservoir and mature geothermal power operations.": "高热流、裂隙型储层和成熟地热发电运营。",
+      "High-temperature hydrothermal system in a tectonically active province.": "构造活动区内的高温热液系统。",
+      "Mid-ocean-ridge volcanism, high heat flow and strong district-heating demand.": "洋中脊火山活动、高热流和强区域供热需求。",
+      "Rift volcanism, permeable faults and growing regional power demand.": "裂谷火山作用、渗透性断裂和增长中的区域电力需求。",
+      "Pull-apart basin, shallow heat anomaly and long operating history.": "拉分盆地、浅部热异常和长期运行经验。",
+      "Arc volcanism, high-temperature reservoirs and grid-connected operations.": "岛弧火山作用、高温储层和并网运行基础。",
+      "High heat flow, hydrothermal reservoirs and mature resource management.": "高热流、热液储层和成熟资源管理。",
+      "High regulated flow, large head and strong grid integration on the Yangtze River.": "长江高调节流量、大水头和强电网接入能力。",
+      "High river flow, cross-border power market and mature transmission systems.": "高河流流量、跨境电力市场和成熟输电系统。",
+      "High discharge basin and major grid role; drought sensitivity matters.": "高径流流域和重要电网支撑作用，但需关注干旱敏感性。",
+      "Large controlled river flow, existing grid and multipurpose water infrastructure.": "大规模可控河流流量、既有电网和多用途水利基础设施。",
+      "Mountain-fed river, storage potential and irrigation-power integration.": "山地补给河流、调蓄潜力和灌溉-发电协同。",
+      "Congo River discharge and falls create exceptional hydropower potential.": "刚果河巨大流量和跌水条件形成突出的水电潜力。",
+      "Large seasonal river flow with major ecological and social constraints.": "大型季节性径流，同时伴随显著生态与社会约束。",
+      "Highland river gradient, storage and regional power-export potential.": "高原河流坡降、调蓄条件和区域电力外送潜力。"
+    };
+
+    const ZH_ENERGY_COPY = {
+      all: {
+        summary: "用于对化石能源盆地、地热系统和大型水电点位进行横向筛选。选择风电或光伏可加载官方连续栅格资源图层。",
+        criteria: ["资源强度", "地质或地形条件", "电网和出口通道", "环境与许可约束"]
+      },
+      multi: {
+        summary: "用于按用户选择的多个能源图层进行横向对比；当选择风电或光伏时，对应热力图会随标记一起显示。",
+        criteria: ["已选资源信号", "基础设施和电网接入", "地形/地质或站址条件", "约束与许可风险"]
+      },
+      coal: {
+        summary: "展示煤系地层、煤层厚度和运输条件较突出的沉积盆地与煤田集群。",
+        criteria: ["煤系地层和煤层连续性", "埋深和剥采比", "矿山安全与地下水条件", "铁路、港口和电力需求"]
+      },
+      oil: {
+        summary: "展示已验证烃源岩、储层、盖层和商业基础设施的油气省区。",
+        criteria: ["烃源岩成熟度", "储层和圈闭质量", "发现密度和油田规模", "管线、港口和炼化接入"]
+      },
+      gas: {
+        summary: "展示常规和非常规天然气省区，资源丰度、产能和市场接入是关键。",
+        criteria: ["含气饱和度和压力", "储层渗透率或压裂潜力", "管网和 LNG 接入", "甲烷、水资源和社区约束"]
+      },
+      wind: {
+        summary: "官方 Global Wind Atlas 风功率密度瓦片以连续热力图显示。强度越高，风资源潜力越强。",
+        criteria: ["风功率密度", "湍流和极端风", "地形粗糙度和尾流影响", "并网和保护区排除"]
+      },
+      solar: {
+        summary: "官方 Global Solar Atlas PVOUT 瓦片以连续热力图显示。强度越高，光伏发电潜力越强。",
+        criteria: ["光伏发电潜力", "辐照和云量", "温度降额和沙尘", "土地、清洗用水和电网约束"]
+      },
+      geothermal: {
+        summary: "展示火山、裂谷和构造活动区中高热流、高温储层和渗透性较好的地热系统。",
+        criteria: ["热流和储层温度", "断裂渗透性", "钻井深度和流体化学", "诱发地震和热/电需求"]
+      },
+      hydro: {
+        summary: "展示具有高流量或高落差潜力的主要水电点位，适宜性高度依赖季节径流、地质和社会影响。",
+        criteria: ["河流流量和落差", "水库和调节能力", "坝址地质和泥沙", "生态、移民和跨境水风险"]
+      },
+      nuclear: {
+        summary: "展示既有和新建核电站址，重点参考冷却水条件、电网接入、负荷中心距离、许可与安全约束。",
+        criteria: ["冷却水条件", "电网容量和负荷接近性", "地震、洪水和安全约束", "许可、核废料和公众接受度风险"]
+      }
+    };
+
+    let currentLanguage = "en";
+
+    // Leaflet and most browser basemaps use Web Mercator, which cannot display
+    // the mathematical poles. The vertical bounds keep panning in the valid
+    // latitude range, while the deliberately huge longitude span lets users pan
+    // horizontally through repeated world copies like Google Maps.
+    const MAX_WEB_MERCATOR_LAT = 85.05112878;
+    const WRAPPED_WORLD_BOUNDS = L.latLngBounds([
+      [-MAX_WEB_MERCATOR_LAT, -1000000],
+      [MAX_WEB_MERCATOR_LAT, 1000000]
+    ]);
+    const HEAT_OPACITY = 0.68;
+
+    // The flat map is still Leaflet's responsibility. Native Leaflet wheel
+    // zoom is disabled below because it emits transitional zoom animation
+    // states that make custom HTML labels drift. A custom wheel handler later
+    // updates fractional zoom directly, matching the smooth behavior of the
+    // right-side slider while keeping labels locked to their projected points.
+    const map = L.map("map", {
+      center: [15, 0],
+      zoom: 3,
+      minZoom: 2,
+      maxZoom: 13,
+      maxBounds: WRAPPED_WORLD_BOUNDS,
+      maxBoundsViscosity: 1.0,
+      worldCopyJump: true,
+      scrollWheelZoom: false,
+      fadeAnimation: true,
+      zoomAnimation: true,
+      markerZoomAnimation: true,
+      zoomSnap: 0,
+      zoomDelta: 0.25,
+      wheelPxPerZoomLevel: 260,
+      wheelDebounceTime: 0,
+      easeLinearity: 0.22,
+      inertia: true,
+      zoomControl: false,
+      attributionControl: false
+    });
+
+    L.control.scale({ position: "bottomleft", imperial: false }).addTo(map);
+    map.createPane("baseFillPane");
+    map.getPane("baseFillPane").style.zIndex = 175;
+    map.createPane("baseMapPane");
+    map.getPane("baseMapPane").style.zIndex = 190;
+    map.createPane("heatPane");
+    map.getPane("heatPane").style.zIndex = 245;
+    map.createPane("calloutPane");
+    map.getPane("calloutPane").style.zIndex = 530;
+
+    const baseFillLayer = L.tileLayer(
+      "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+      {
+        pane: "baseFillPane",
+        subdomains: "abcd",
+        minZoom: 2,
+        maxNativeZoom: 20,
+        maxZoom: 20,
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        updateWhenZooming: false,
+        updateInterval: 120,
+        attribution: "Basemap fallback: CARTO Voyager, OpenStreetMap contributors"
+      }
+    ).addTo(map);
+
+    const baseLayer = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+      {
+        pane: "baseMapPane",
+        minZoom: 2,
+        maxNativeZoom: 19,
+        maxZoom: 19,
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        updateWhenZooming: false,
+        updateInterval: 120,
+        attribution: "Basemap: Esri World Street Map | Resource data: Global Wind Atlas, Global Solar Atlas, Wikipedia-linked public pages"
+      }
+    ).addTo(map);
+
+    // Cache all persistent DOM handles once. The app updates these elements
+    // repeatedly during language switches, mode changes, sidebar collapse, and
+    // renderer switches, so centralizing selectors avoids fragile repeated
+    // querySelector calls throughout the interaction code.
+    const htmlLineLayer = document.querySelector("#htmlLineLayer");
+    const htmlMarkerLayer = document.querySelector("#htmlMarkerLayer");
+    const globeScene = document.querySelector("#globeScene");
+    const globeCanvas = document.querySelector("#globeCanvas");
+    const globeLineLayer = document.querySelector("#globeLineLayer");
+    const globeMarkerLayer = document.querySelector("#globeMarkerLayer");
+    const resourceInfoPanel = document.querySelector("#resourceInfoPanel");
+    const mapStyleSelect = document.querySelector("#mapStyleSelect");
+    const mapStyleLabel = document.querySelector("#mapStyleLabel");
+    const markerModeSelect = document.querySelector("#markerModeSelect");
+    const markerModeLabel = document.querySelector("#markerModeLabel");
+    const languageSelect = document.querySelector("#languageSelect");
+    const sidebarToggle = document.querySelector("#sidebarToggle");
+    const zoomSlider = document.querySelector("#zoomSlider");
+    const zoomSliderValue = document.querySelector("#zoomSliderValue");
+    const cursorPosition = document.querySelector("#cursorPosition");
+    const activeSource = document.querySelector("#activeSource");
+    const brandKicker = document.querySelector("#brandKicker");
+    const languageLabel = document.querySelector("#languageLabel");
+    const appTitle = document.querySelector("#appTitle");
+    const appSubtitle = document.querySelector("#appSubtitle");
+    const aboutFooterTitle = document.querySelector("#aboutFooterTitle");
+    const sourcesFooterTitle = document.querySelector("#sourcesFooterTitle");
+    const generatedBrief = document.querySelector("#generatedBrief");
+    const criteriaPanelTitle = document.querySelector("#criteriaPanelTitle");
+    const criteriaPanelValue = document.querySelector("#criteriaPanelValue");
+    const pointsPanelTitle = document.querySelector("#pointsPanelTitle");
+    const pointsPanelValue = document.querySelector("#pointsPanelValue");
+    const criteriaList = document.querySelector("#criteriaList");
+    const pointList = document.querySelector("#pointList");
+    const modelPanelTitle = document.querySelector("#modelPanelTitle");
+    const modelPanelValue = document.querySelector("#modelPanelValue");
+    const shortlistPanelTitle = document.querySelector("#shortlistPanelTitle");
+    const shortlistPanelValue = document.querySelector("#shortlistPanelValue");
+    const evidencePanelTitle = document.querySelector("#evidencePanelTitle");
+    const evidencePanelValue = document.querySelector("#evidencePanelValue");
+    const modelNote = document.querySelector("#modelNote");
+    const candidateList = document.querySelector("#candidateList");
+    const qualityList = document.querySelector("#qualityList");
+    const exportCsvButton = document.querySelector("#exportCsv");
+    const exportGeojsonButton = document.querySelector("#exportGeojson");
+    const exportReportButton = document.querySelector("#exportReport");
+    const weightInputs = Array.from(document.querySelectorAll("[data-weight]"));
+    const generatedLabel = document.querySelector("#generatedLabel");
+    const generatedAt = document.querySelector("#generatedAt");
+    const sourceList = document.querySelector("#sourceList");
+    const floatingTitle = document.querySelector("#floatingTitle");
+    const floatingSubtitle = document.querySelector("#floatingSubtitle");
+    const legendTitle = document.querySelector("#legendTitle");
+    const lowerRasterLabel = document.querySelector("#lowerRasterLabel");
+    const higherRasterLabel = document.querySelector("#higherRasterLabel");
+    const markerLegendLabel = document.querySelector("#markerLegendLabel");
+    const rasterLegendLabel = document.querySelector("#rasterLegendLabel");
+    const resetViewButton = document.querySelector("#resetView");
+    const labelToggleButton = document.querySelector("#labelToggle");
+
+    const groups = {};
+    const callouts = [];
+    const markerByName = new Map();
+    const ENERGY_ORDER = ["wind", "solar", "coal", "oil", "gas", "geothermal", "hydro", "nuclear"];
+    const MARKER_POINT_MODES = new Set(["coal", "oil", "gas", "geothermal", "hydro", "nuclear"]);
+    let activeMode = "all";
+    let markerMode = "all";
+    let selectedModes = new Set(ENERGY_ORDER);
+    let activePointName = "";
+    let annotationFrame = 0;
+    let currentMapStyle = "flat";
+    let selectedFeatureName = "";
+    let labelsHidden = false;
+    // Default consulting-screening weights. They are intentionally simple and
+    // client-side so a consultant can tune assumptions live during a workshop
+    // without regenerating the HTML file or changing the source datasets.
+    const screeningWeights = {
+      resource: 45,
+      infrastructure: 20,
+      terrain: 20,
+      constraint: 15
+    };
+    const flatWheelZoom = {
+      targetZoom: 3,
+      anchorPoint: null,
+      anchorLatLng: null,
+      frame: 0
+    };
+
+    // Keep wrapped points aligned with the currently visible world copy. Leaflet
+    // repeats tiles horizontally; point annotations must choose the nearest
+    // longitude copy instead of staying pinned to the original -180..180 world.
+    function longitudeNearView(lng) {
+      const centerLng = map.getCenter().lng;
+      return lng + Math.round((centerLng - lng) / 360) * 360;
+    }
+
+    function featureLatLng(feature) {
+      return L.latLng(feature.lat, longitudeNearView(feature.lon));
+    }
+
+    function scheduleAnnotationRender() {
+      if (annotationFrame) return;
+      annotationFrame = window.requestAnimationFrame(() => {
+        annotationFrame = 0;
+        renderHtmlAnnotations();
+      });
+    }
+
+    function refreshFlatAnnotationsNow() {
+      callouts.forEach(c => c.update());
+      renderHtmlAnnotations();
+      positionResourceInfoPanel();
+    }
+
+    // One visible zoom control drives two different renderers. In flat mode the
+    // value is Leaflet's zoom. In globe mode it is a user-facing zoom number
+    // converted to camera distance, so the control remains understandable when
+    // the underlying implementation changes.
+    function syncZoomSlider() {
+      const zoom = currentMapStyle === "globe" ? globeDistanceToZoom(globeState.targetDistance) : map.getZoom();
+      zoomSlider.value = String(zoom);
+      zoomSliderValue.textContent = Number.isInteger(zoom) ? String(zoom) : zoom.toFixed(1);
+    }
+
+    function syncSidebarToggleText() {
+      const copy = ui();
+      const collapsed = document.body.classList.contains("sidebar-collapsed");
+      const rtl = document.documentElement.dir === "rtl";
+      sidebarToggle.textContent = collapsed ? (rtl ? "<" : ">") : (rtl ? ">" : "<");
+      sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+      sidebarToggle.setAttribute("aria-label", collapsed ? (copy.showSidebar || UI_TEXT.en.showSidebar) : (copy.hideSidebar || UI_TEXT.en.hideSidebar));
+    }
+
+    function labelToggleCopy() {
+      return LABEL_TOGGLE_TEXT[currentLanguage] || LABEL_TOGGLE_TEXT.en;
+    }
+
+    function updateLabelToggleButton() {
+      const copy = labelToggleCopy();
+      labelToggleButton.textContent = labelsHidden ? copy.show : copy.hide;
+      labelToggleButton.title = labelsHidden ? copy.showTitle : copy.hideTitle;
+      labelToggleButton.setAttribute("aria-label", labelsHidden ? copy.showTitle : copy.hideTitle);
+      labelToggleButton.classList.toggle("active", labelsHidden);
+      labelToggleButton.setAttribute("aria-pressed", String(labelsHidden));
+    }
+
+    function screeningCopy() {
+      return SCREENING_TEXT[currentLanguage] || SCREENING_TEXT.en;
+    }
+
+    function weightTotal() {
+      return Object.values(screeningWeights).reduce((sum, value) => sum + Number(value || 0), 0) || 1;
+    }
+
+    function weightShare(key) {
+      return Number(screeningWeights[key] || 0) / weightTotal();
+    }
+
+    function keywordScore(text, positiveWords, negativeWords = []) {
+      const value = String(text || "").toLowerCase();
+      let score = 0;
+      positiveWords.forEach(word => {
+        if (value.includes(word)) score += 0.07;
+      });
+      negativeWords.forEach(word => {
+        if (value.includes(word)) score -= 0.08;
+      });
+      return score;
+    }
+
+    function infrastructureProxy(lat, lng, text = "") {
+      const absLat = Math.abs(lat);
+      let score = 0.52;
+      score += keywordScore(text, ["grid", "port", "rail", "pipeline", "lng", "export", "market", "demand", "industrial", "storage"]);
+      score += absLat < 55 ? 0.06 : -0.08;
+      score += Math.abs(lng) < 20 ? 0.03 : 0;
+      return clamp01(score);
+    }
+
+    function constraintProxy(lat, text = "") {
+      let score = 0.72;
+      score += keywordScore(text, ["existing", "mature", "controlled", "storage"], ["deepwater", "remote", "drought", "ecological", "social", "protected", "seismic", "water", "permitting"]);
+      if (Math.abs(lat) < 8) score -= 0.06;
+      return clamp01(score);
+    }
+
+    // Convert a public reference point into four normalized screening factors.
+    // The point dataset does not contain reserve estimates, project capex, or
+    // grid studies, so this deliberately remains a transparent heuristic based
+    // on resource type, public summary keywords, location, and visible access
+    // signals. That makes the score explainable during pre-feasibility scoping.
+    function pointComponents(feature) {
+      const text = `${feature.name} ${feature.metric} ${feature.drivers} ${feature.summary}`;
+      const energyBase = {
+        coal: 0.68,
+        oil: 0.72,
+        gas: 0.70,
+        geothermal: 0.64,
+        hydro: 0.66,
+        nuclear: 0.67
+      }[feature.energy] || 0.6;
+      const resource = clamp01(energyBase + keywordScore(text, ["major", "large", "giant", "supergiant", "world", "high", "exceptional", "historic", "proven"]));
+      const infrastructure = infrastructureProxy(feature.lat, feature.lon, text);
+      const terrain = clamp01(0.58 + keywordScore(text, ["basin", "rift", "river", "reservoir", "plateau", "coastal", "controlled"], ["deepwater", "remote", "steep"]));
+      const constraint = constraintProxy(feature.lat, text);
+      return { resource, infrastructure, terrain, constraint };
+    }
+
+    // Convert a wind or solar seed centroid into the same four-factor structure
+    // used by fossil, geothermal, and hydro point references. The resource
+    // factor comes from the browser-side suitability surface; the other factors
+    // are high-level consulting proxies until authoritative GIS layers are
+    // wired into the generator.
+    function rasterComponents(seed, kind) {
+      const [name, lat, lon, region, note] = seed;
+      const resource = kind === "solar" ? solarSuitability(lat, lon) : windSuitability(lat, lon);
+      const infrastructure = infrastructureProxy(lat, lon, `${name} ${region} ${note}`);
+      const terrain = clamp01((kind === "solar" ? 0.62 : 0.58) + keywordScore(note, ["corridor", "belt", "coastal", "offshore", "desert", "industrial"], ["remote", "terrain"]));
+      const constraint = constraintProxy(lat, `${name} ${note}`);
+      return { resource, infrastructure, terrain, constraint };
+    }
+
+    function weightedScore(components) {
+      return clamp01(
+        components.resource * weightShare("resource") +
+        components.infrastructure * weightShare("infrastructure") +
+        components.terrain * weightShare("terrain") +
+        components.constraint * weightShare("constraint")
+      );
+    }
+
+    function activeEnergyModes() {
+      if (markerMode === "all") return ENERGY_ORDER.slice();
+      if (markerMode === "multi") {
+        const modes = ENERGY_ORDER.filter(mode => selectedModes.has(mode));
+        return modes.length ? modes : [activeMode === "all" || activeMode === "multi" ? "coal" : activeMode];
+      }
+      return [activeMode === "all" || activeMode === "multi" ? "coal" : activeMode];
+    }
+
+    function panelMode() {
+      if (markerMode === "all") return "all";
+      if (markerMode === "multi") return "multi";
+      return activeMode;
+    }
+
+    function modeFeatures(mode) {
+      if (mode === "wind" || mode === "solar") return RASTER_REFERENCE_POINTS[mode] || [];
+      return APP_DATA.points.filter(point => point.energy === mode);
+    }
+
+    function featureVisible(feature) {
+      if (markerMode === "all") return true;
+      if (markerMode === "multi") return selectedModes.has(feature.energy);
+      return activeMode === feature.energy;
+    }
+
+    // Build one ranked table for whatever layer is active. Keeping points and
+    // raster-derived candidates behind the same row contract lets the sidebar,
+    // map focus behavior, CSV export, GeoJSON export, and report export share
+    // one implementation path instead of drifting apart.
+    function candidateRows(mode = activeMode) {
+      const rows = [];
+      const modes = mode === "all" || mode === "multi" ? activeEnergyModes() : [mode];
+      modes.forEach(energyMode => {
+        if (energyMode === "wind" || energyMode === "solar") {
+          (RASTER_REFERENCE_POINTS[energyMode] || []).forEach(feature => {
+          const seed = [feature.name, feature.lat, feature.lon, feature.region, feature.drivers];
+          const components = rasterComponents(seed, energyMode);
+          rows.push({
+            type: "raster",
+            energy: energyMode,
+            name: feature.name,
+            region: feature.region,
+            lat: feature.lat,
+            lon: feature.lon,
+            note: localizedFeatureDrivers(feature),
+            source: APP_DATA.layers[energyMode]?.label || energyMode,
+            featureName: feature.name,
+            components,
+            score: weightedScore(components)
+          });
+        });
+        } else {
+          APP_DATA.points.filter(point => point.energy === energyMode).forEach(feature => {
+          const components = pointComponents(feature);
+          rows.push({
+            type: "point",
+            energy: feature.energy,
+            name: feature.name,
+            region: feature.region,
+            lat: feature.lat,
+            lon: feature.lon,
+            note: localizedFeatureDrivers(feature),
+            source: feature.source_title || feature.source_url || "public reference",
+            featureName: feature.name,
+            components,
+            score: weightedScore(components)
+          });
+        });
+        }
+      });
+      return rows.sort((a, b) => b.score - a.score);
+    }
+
+    function scorePercent(value) {
+      return `${Math.round(value * 100)}`;
+    }
+
+    function renderScreeningModel() {
+      const copy = screeningCopy();
+      modelPanelTitle.textContent = copy.modelTitle;
+      modelPanelValue.textContent = copy.modelValue;
+      modelNote.textContent = copy.modelNote;
+      document.querySelector("#resourceWeightLabel").textContent = copy.resource;
+      document.querySelector("#infrastructureWeightLabel").textContent = copy.infrastructure;
+      document.querySelector("#terrainWeightLabel").textContent = copy.terrain;
+      document.querySelector("#constraintWeightLabel").textContent = copy.constraint;
+      weightInputs.forEach(input => {
+        input.value = String(screeningWeights[input.dataset.weight]);
+        const output = document.querySelector(`#${input.dataset.weight}WeightValue`);
+        if (output) output.textContent = `${screeningWeights[input.dataset.weight]}%`;
+      });
+    }
+
+    function focusCandidate(row) {
+      if (row.featureName && markerByName.has(row.featureName)) {
+        selectPoint(row.featureName, true);
+        return;
+      }
+      if (currentMapStyle === "globe") {
+        globeState.targetYaw = -THREE.MathUtils.degToRad(row.lon) - Math.PI / 2;
+        globeState.targetPitch = THREE.MathUtils.degToRad(row.lat);
+        globeState.targetDistance = Math.min(globeState.targetDistance, 2.35);
+        syncZoomSlider();
+      } else {
+        map.flyTo([row.lat, longitudeNearView(row.lon)], Math.max(map.getZoom(), 5), { duration: 0.65, easeLinearity: 0.22 });
+      }
+      cursorPosition.textContent = `${modeLabel(row.energy)} shortlist: ${row.name}`;
+    }
+
+    // Render the operational shortlist used in consulting conversations. Each
+    // row exposes the total score and component scores so the client can see
+    // why a location ranks highly instead of treating the score as a black box.
+    function renderCandidateShortlist() {
+      const copy = screeningCopy();
+      const rows = candidateRows();
+      const visibleRows = rows.slice(0, markerMode === "all" || markerMode === "multi" ? 12 : 8);
+      shortlistPanelTitle.textContent = copy.shortlistTitle;
+      shortlistPanelValue.textContent = `${visibleRows.length} ${copy.shortlistValue}`;
+      candidateList.replaceChildren(...visibleRows.map((row, index) => {
+        const li = document.createElement("li");
+        li.className = "candidate-item";
+        li.innerHTML = `
+          <div class="candidate-title"><span>${index + 1}. ${escapeHtml(row.name)}</span><span class="score-pill">${copy.score} ${scorePercent(row.score)}</span></div>
+          <div class="score-bar"><span style="--score:${scorePercent(row.score)}%"></span></div>
+          <div class="candidate-meta">${escapeHtml(modeLabel(row.energy))} · ${escapeHtml(row.region)} · ${row.lat.toFixed(2)}, ${row.lon.toFixed(2)}</div>
+          <div class="component-row">
+            <span>${copy.resource}: ${scorePercent(row.components.resource)}</span>
+            <span>${copy.infrastructure}: ${scorePercent(row.components.infrastructure)}</span>
+            <span>${copy.terrain}: ${scorePercent(row.components.terrain)}</span>
+            <span>${copy.constraint}: ${scorePercent(row.components.constraint)}</span>
+          </div>
+        `;
+        li.addEventListener("click", () => focusCandidate(row));
+        return li;
+      }));
+    }
+
+    function renderEvidencePanel() {
+      const copy = screeningCopy();
+      const layer = APP_DATA.layers[activeMode];
+      evidencePanelTitle.textContent = copy.evidenceTitle;
+      evidencePanelValue.textContent = copy.evidenceValue;
+      const qualityRows = [
+        ["Decision use", copy.dataQuality],
+        ["Active dataset", layer ? layer.label : `${modeLabel(activeMode)} public reference points`],
+        ["Known gaps", activeMode === "wind" || activeMode === "solar" ? "Heatmap is a browser-side screening surface referenced to public atlas metadata; confirm with licensed raster values." : "Point anchors are not polygonal resource boundaries; confirm with authoritative basin, lease, field or project datasets."],
+        ["Reproducibility", `Generated ${APP_DATA.generatedAt}; exports include weights and source notes.`]
+      ];
+      qualityList.replaceChildren(...qualityRows.map(([label, value]) => {
+        const li = document.createElement("li");
+        li.className = "quality-row";
+        li.innerHTML = `<strong>${escapeHtml(label)}</strong><span>${escapeHtml(value)}</span>`;
+        return li;
+      }));
+      exportReportButton.textContent = copy.exportReport;
+    }
+
+    // Stable export contract for downstream work. Field names are intentionally
+    // plain and GIS-friendly so the CSV/GeoJSON/report outputs can be loaded
+    // into spreadsheets, QGIS, ArcGIS, or a later project database.
+    function activeScreeningRowsForExport() {
+      return candidateRows(activeMode).map((row, index) => ({
+        rank: index + 1,
+        name: row.name,
+        energy: row.energy,
+        region: row.region,
+        latitude: Number(row.lat.toFixed(5)),
+        longitude: Number(row.lon.toFixed(5)),
+        score: Number((row.score * 100).toFixed(1)),
+        resource: Number((row.components.resource * 100).toFixed(1)),
+        access: Number((row.components.infrastructure * 100).toFixed(1)),
+        terrain: Number((row.components.terrain * 100).toFixed(1)),
+        constraints: Number((row.components.constraint * 100).toFixed(1)),
+        note: row.note,
+        source: row.source
+      }));
+    }
+
+    function downloadTextFile(filename, mimeType, text) {
+      const blob = new Blob([text], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    // CSV is the fastest handoff format for workshops and spreadsheet-based
+    // comparison. It mirrors activeScreeningRowsForExport exactly so the user
+    // sees the same ranks and weights that are visible in the UI.
+    function exportScreeningCsv() {
+      const rows = activeScreeningRowsForExport();
+      const headers = Object.keys(rows[0] || { rank: 1, name: "", energy: "", region: "", latitude: "", longitude: "", score: "" });
+      const escapeCsv = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
+      const csv = [headers.join(","), ...rows.map(row => headers.map(header => escapeCsv(row[header])).join(","))].join("\n");
+      downloadTextFile(`energy-screening-${activeMode}.csv`, "text/csv;charset=utf-8", csv);
+    }
+
+    // GeoJSON gives the shortlist a spatial handoff path. It stores candidates
+    // as point features for now; the same properties object can later be reused
+    // when wind/solar candidates become polygons or project areas.
+    function exportScreeningGeojson() {
+      const features = activeScreeningRowsForExport().map(row => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [row.longitude, row.latitude] },
+        properties: row
+      }));
+      downloadTextFile(
+        `energy-screening-${activeMode}.geojson`,
+        "application/geo+json;charset=utf-8",
+        JSON.stringify({ type: "FeatureCollection", features }, null, 2)
+      );
+    }
+
+    // JSON report preserves methodology, weights, ranked rows, and source links
+    // together. This makes a generated HTML review reproducible after a meeting
+    // even if the user adjusts weights several times during the session.
+    function exportScreeningReport() {
+      const payload = {
+        title: "Global energy resource preliminary screening report",
+        generatedAt: APP_DATA.generatedAt,
+        activeMode,
+        activeModeLabel: modeLabel(activeMode),
+        weights: { ...screeningWeights },
+        methodology: APP_DATA.screeningModel,
+        rows: activeScreeningRowsForExport(),
+        sources: APP_DATA.sources
+      };
+      downloadTextFile(
+        `energy-screening-${activeMode}-report.json`,
+        "application/json;charset=utf-8",
+        JSON.stringify(payload, null, 2)
+      );
+    }
+
+    function renderProfessionalPanels() {
+      renderScreeningModel();
+      renderCandidateShortlist();
+      renderEvidencePanel();
+    }
+
+
+    function wheelDeltaPixels(event) {
+      if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 16;
+      if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) return event.deltaY * window.innerHeight;
+      return event.deltaY;
+    }
+
+    function applyFlatZoom(zoom, anchorPoint = null, anchorLatLng = null) {
+      const boundedZoom = clamp(zoom, map.getMinZoom(), map.getMaxZoom());
+      if (anchorPoint && anchorLatLng) {
+        const anchorPixel = map.project(anchorLatLng, boundedZoom);
+        const centerPixel = anchorPixel
+          .subtract(anchorPoint)
+          .add(map.getSize().divideBy(2));
+        map.setView(map.unproject(centerPixel, boundedZoom), boundedZoom, { animate: false });
+      } else {
+        map.setZoom(boundedZoom, { animate: false });
+      }
+      syncZoomSlider();
+      refreshFlatAnnotationsNow();
+    }
+
+    // Custom flat-map wheel zoom keeps the geographic point under the cursor
+    // stable while still applying at most one map update per animation frame.
+    // The explicit projection math gives Google-Maps-style cursor anchoring
+    // without using Leaflet's animated wheel path, which previously made custom
+    // HTML labels drift during rapid wheel gestures.
+    function scheduleFlatWheelZoom() {
+      if (flatWheelZoom.frame) return;
+      flatWheelZoom.frame = window.requestAnimationFrame(() => {
+        flatWheelZoom.frame = 0;
+        applyFlatZoom(flatWheelZoom.targetZoom, flatWheelZoom.anchorPoint, flatWheelZoom.anchorLatLng);
+        flatWheelZoom.anchorPoint = null;
+        flatWheelZoom.anchorLatLng = null;
+      });
+    }
+
+    function handleFlatWheelZoom(event) {
+      if (currentMapStyle !== "flat") return;
+      event.preventDefault();
+      const delta = wheelDeltaPixels(event);
+      const baseZoom = flatWheelZoom.frame ? flatWheelZoom.targetZoom : map.getZoom();
+      const anchorPoint = map.mouseEventToContainerPoint(event);
+      flatWheelZoom.anchorPoint = anchorPoint;
+      flatWheelZoom.anchorLatLng = map.containerPointToLatLng(anchorPoint);
+      flatWheelZoom.targetZoom = clamp(
+        baseZoom - delta / 220,
+        map.getMinZoom(),
+        map.getMaxZoom()
+      );
+      scheduleFlatWheelZoom();
+    }
+
+    // Labels and dots are rebuilt frequently during animated zoom and 3D
+    // rotation. Binding selection to pointerdown makes the interaction robust
+    // even if a label element is replaced before the browser dispatches click.
+    function attachFeatureSelectionHandlers(element, feature) {
+      const select = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        selectPoint(feature.name, false);
+      };
+      element.addEventListener("pointerdown", select);
+      element.addEventListener("click", select);
+      element.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") select(event);
+      });
+    }
+
+    function wrapLongitude(lng) {
+      return ((lng + 540) % 360) - 180;
+    }
+
+    function gaussian(value, center, spread) {
+      const normalized = (value - center) / spread;
+      return Math.exp(-normalized * normalized);
+    }
+
+    function longitudeDelta(lng, center) {
+      return Math.abs(wrapLongitude(lng - center));
+    }
+
+    function hotspot(lat, lng, centerLat, centerLng, latSpread, lngSpread, weight) {
+      const latScore = gaussian(lat, centerLat, latSpread);
+      const lngScore = gaussian(longitudeDelta(lng, centerLng), 0, lngSpread);
+      return weight * latScore * lngScore;
+    }
+
+    function clamp01(value) {
+      return Math.max(0, Math.min(1, value));
+    }
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    // Public wind and solar ImageServer layers expose LERC raster tiles, which
+    // normal <img> map tiles cannot decode in a standalone browser page. These
+    // lightweight suitability functions provide a maintainable browser-side
+    // proxy surface: they reproduce the broad geographic resource patterns for
+    // screening and keep the UI responsive without a server-side raster stack.
+    function windSuitability(lat, lng) {
+      const absLat = Math.abs(lat);
+      let value = 0.12;
+      value += 0.34 * gaussian(absLat, 47, 18);
+      value += 0.18 * gaussian(absLat, 18, 10);
+      value -= 0.24 * gaussian(absLat, 0, 9);
+      value += hotspot(lat, lng, 54, 4, 8, 18, 0.38);      // North Sea
+      value += hotspot(lat, lng, 39, -101, 9, 18, 0.32);   // Great Plains
+      value += hotspot(lat, lng, -45, -70, 8, 16, 0.42);   // Patagonia
+      value += hotspot(lat, lng, 44, 96, 10, 22, 0.28);    // Gobi / Inner Asia
+      value += hotspot(lat, lng, 8, 45, 8, 15, 0.24);      // Horn of Africa
+      value += hotspot(lat, lng, -32, 137, 10, 20, 0.24);  // Southern Australia
+      value += hotspot(lat, lng, -25, -70, 8, 8, 0.22);    // Atacama coast
+      value += hotspot(lat, lng, 36, -8, 7, 10, 0.18);     // Iberia / Morocco
+      return clamp01(value);
+    }
+
+    function solarSuitability(lat, lng) {
+      const absLat = Math.abs(lat);
+      let value = 0.16;
+      value += 0.44 * gaussian(absLat, 25, 18);
+      value -= 0.32 * gaussian(absLat, 0, 10);
+      value -= 0.28 * gaussian(absLat, 72, 18);
+      value += hotspot(lat, lng, 23, 13, 13, 28, 0.42);     // Sahara
+      value += hotspot(lat, lng, 24, 45, 11, 20, 0.36);     // Arabian Peninsula
+      value += hotspot(lat, lng, -24, 134, 12, 26, 0.38);   // Australia interior
+      value += hotspot(lat, lng, -24, -69, 8, 8, 0.46);     // Atacama
+      value += hotspot(lat, lng, 34, -113, 9, 13, 0.30);    // US Southwest
+      value += hotspot(lat, lng, -23, 18, 10, 16, 0.28);    // Namib / Kalahari
+      value += hotspot(lat, lng, 30, 78, 9, 15, 0.20);      // Tibetan Plateau
+      return clamp01(value);
+    }
+
+    // Shared color ramp for both the Leaflet canvas heat tiles and the Three.js
+    // globe heat texture. Keeping the ramp in one function guarantees the same
+    // meaning for low/high resource intensity across flat and 3D views.
+    function heatRgba(value) {
+      const stops = [
+        [0.00, [49, 46, 129, 0.18]],
+        [0.18, [14, 165, 233, 0.34]],
+        [0.40, [34, 197, 94, 0.44]],
+        [0.62, [250, 204, 21, 0.58]],
+        [0.80, [249, 115, 22, 0.66]],
+        [1.00, [220, 38, 38, 0.76]]
+      ];
+      for (let i = 1; i < stops.length; i += 1) {
+        if (value <= stops[i][0]) {
+          const [leftStop, leftColor] = stops[i - 1];
+          const [rightStop, rightColor] = stops[i];
+          const ratio = (value - leftStop) / (rightStop - leftStop || 1);
+          const color = leftColor.map((channel, index) => channel + (rightColor[index] - channel) * ratio);
+          return [color[0], color[1], color[2], color[3] * 255];
+        }
+      }
+      const last = stops[stops.length - 1][1];
+      return [last[0], last[1], last[2], last[3] * 255];
+    }
+
+    // Flat-map heat layer. Each Leaflet tile is generated as a canvas, converted
+    // from tile pixel coordinates back into lat/lon, sampled through the same
+    // suitability model, and then painted with the shared heat color ramp. This
+    // avoids broken browser display of raw LERC raster tiles while preserving
+    // smooth pan/zoom behavior and normal Leaflet layer management.
+    const SuitabilityHeatLayer = L.GridLayer.extend({
+      initialize(kind, options) {
+        this.kind = kind;
+        L.GridLayer.prototype.initialize.call(this, options);
+      },
+      createTile(coords, done) {
+        const tile = L.DomUtil.create("canvas", "suitability-heat-tile");
+        const size = this.getTileSize();
+        const ctx = tile.getContext("2d", { alpha: true });
+        tile.width = size.x;
+        tile.height = size.y;
+        const image = ctx.createImageData(size.x, size.y);
+        const data = image.data;
+        for (let y = 0; y < size.y; y += 1) {
+          for (let x = 0; x < size.x; x += 1) {
+            const worldPoint = L.point(coords.x * size.x + x + 0.5, coords.y * size.y + y + 0.5);
+            const latlng = this._map.unproject(worldPoint, coords.z);
+            const lat = Math.max(-MAX_WEB_MERCATOR_LAT, Math.min(MAX_WEB_MERCATOR_LAT, latlng.lat));
+            const lng = wrapLongitude(latlng.lng);
+            const value = this.kind === "solar" ? solarSuitability(lat, lng) : windSuitability(lat, lng);
+            const color = heatRgba(value);
+            const offset = (y * size.x + x) * 4;
+            data[offset] = color[0];
+            data[offset + 1] = color[1];
+            data[offset + 2] = color[2];
+            data[offset + 3] = color[3];
+          }
+        }
+        ctx.putImageData(image, 0, 0);
+        done(null, tile);
+        return tile;
+      }
+    });
+
+    const heatLayers = {
+      wind: new SuitabilityHeatLayer("wind", {
+        pane: "heatPane",
+        opacity: HEAT_OPACITY,
+        minZoom: 2,
+        maxZoom: 13,
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        updateWhenZooming: false,
+        updateInterval: 120,
+        attribution: APP_DATA.layers.wind.attribution
+      }),
+      solar: new SuitabilityHeatLayer("solar", {
+        pane: "heatPane",
+        opacity: HEAT_OPACITY,
+        minZoom: 2,
+        maxZoom: 13,
+        keepBuffer: 8,
+        updateWhenIdle: false,
+        updateWhenZooming: false,
+        updateInterval: 120,
+        attribution: APP_DATA.layers.solar.attribution
+      })
+    };
+
+    // Three.js state is intentionally isolated from Leaflet state. The flat map
+    // and globe share APP_DATA and UI controls, but their renderers, camera
+    // position, animation loop, heat surfaces, and point meshes are separate.
+    // This keeps the map-style switch cheap: toggling modes hides one renderer
+    // and refreshes the other instead of rebuilding all application data.
+    const globeState = {
+      initialized: false,
+      animating: false,
+      renderer: null,
+      scene: null,
+      camera: null,
+      group: null,
+      pointGroup: null,
+      heatWind: null,
+      heatSolar: null,
+      targetYaw: -Math.PI / 2,
+      targetPitch: 0,
+      targetDistance: 3.2,
+      pointerDown: false,
+      lastPointer: { x: 0, y: 0 }
+    };
+
+    // The sidebar zoom slider is expressed as a map-like zoom level even in 3D
+    // mode. These conversion helpers map that familiar number to the globe
+    // camera's distance range and back again.
+    function globeZoomToDistance(zoom) {
+      const ratio = (Math.max(2, Math.min(13, zoom)) - 2) / 11;
+      return 4.4 - ratio * 2.7;
+    }
+
+    function globeDistanceToZoom(distance) {
+      const ratio = (4.4 - Math.max(1.7, Math.min(4.4, distance))) / 2.7;
+      return 2 + ratio * 11;
+    }
+
+    // If the external Earth texture is blocked, slow, or unavailable, the globe
+    // should still show an interpretable planet rather than a blank sphere. This
+    // procedural texture is only a graceful fallback; the higher-fidelity bitmap
+    // replaces it asynchronously when it loads.
+    function createFallbackEarthTexture() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 2048;
+      canvas.height = 1024;
+      const ctx = canvas.getContext("2d");
+      const ocean = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      ocean.addColorStop(0, "#8ccfe4");
+      ocean.addColorStop(0.5, "#2f9fc2");
+      ocean.addColorStop(1, "#117093");
+      ctx.fillStyle = ocean;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "rgba(235, 227, 178, 0.88)";
+      [
+        [290, 250, 340, 220], [430, 455, 230, 330], [930, 245, 470, 230],
+        [1000, 470, 300, 300], [1300, 330, 330, 260], [1530, 650, 230, 165],
+        [1700, 330, 155, 170]
+      ].forEach(([x, y, w, h]) => {
+        ctx.beginPath();
+        ctx.ellipse(x, y, w, h, 0, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.fillStyle = "rgba(86, 143, 93, 0.38)";
+      for (let i = 0; i < 220; i += 1) {
+        const x = Math.random() * canvas.width;
+        const y = 170 + Math.random() * 650;
+        ctx.beginPath();
+        ctx.ellipse(x, y, 20 + Math.random() * 70, 8 + Math.random() * 28, Math.random() * Math.PI, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      return texture;
+    }
+
+    function mercatorTileLatitude(tileY, zoom) {
+      const n = Math.PI - (2 * Math.PI * tileY) / (2 ** zoom);
+      return THREE.MathUtils.radToDeg(Math.atan(Math.sinh(n)));
+    }
+
+    function loadGlobeTile(url) {
+      return new Promise(resolve => {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.onload = () => resolve(image);
+        image.onerror = () => resolve(null);
+        image.src = url;
+      });
+    }
+
+    async function applyDetailedEarthTexture(material) {
+      const zoom = 4;
+      const tileCount = 2 ** zoom;
+      const canvas = document.createElement("canvas");
+      canvas.width = 4096;
+      canvas.height = 2048;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#14384a";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // The detailed globe texture is assembled from public Esri topographic
+      // tiles. Web Mercator tiles are drawn into an equirectangular canvas by
+      // converting each tile's geographic bounds to texture-space rectangles.
+      // It is not a scientific reprojection, but it gives the 3D mode much
+      // sharper coastlines, terrain, and place context than a single 2K bitmap.
+      const jobs = [];
+      for (let y = 0; y < tileCount; y += 1) {
+        for (let x = 0; x < tileCount; x += 1) {
+          const url = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/${zoom}/${y}/${x}`;
+          jobs.push(loadGlobeTile(url).then(image => {
+            if (!image) return;
+            const west = (x / tileCount) * 360 - 180;
+            const east = ((x + 1) / tileCount) * 360 - 180;
+            const north = mercatorTileLatitude(y, zoom);
+            const south = mercatorTileLatitude(y + 1, zoom);
+            const dx = ((west + 180) / 360) * canvas.width;
+            const dw = ((east - west) / 360) * canvas.width;
+            const dy = ((90 - north) / 180) * canvas.height;
+            const dh = ((north - south) / 180) * canvas.height;
+            ctx.drawImage(image, dx, dy, dw + 1, dh + 1);
+          }));
+        }
+      }
+
+      try {
+        await Promise.all(jobs);
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.anisotropy = globeState.renderer?.capabilities?.getMaxAnisotropy?.() || 1;
+        texture.needsUpdate = true;
+        material.map = texture;
+        material.needsUpdate = true;
+      } catch (error) {
+        console.warn("Detailed globe texture could not be applied", error);
+      }
+    }
+
+    // Build a single equirectangular heat texture for the 3D sphere. The globe
+    // cannot reuse Leaflet's tiled canvas layer because Three.js needs one
+    // texture mapped onto sphere UV coordinates, so this samples the same
+    // wind/solar suitability functions into a 1024x512 raster.
+    function createGlobeHeatTexture(kind) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1024;
+      canvas.height = 512;
+      const ctx = canvas.getContext("2d", { alpha: true });
+      const image = ctx.createImageData(canvas.width, canvas.height);
+      const data = image.data;
+      for (let y = 0; y < canvas.height; y += 1) {
+        const lat = 90 - (y / (canvas.height - 1)) * 180;
+        for (let x = 0; x < canvas.width; x += 1) {
+          const lng = (x / (canvas.width - 1)) * 360 - 180;
+          const value = kind === "solar" ? solarSuitability(lat, lng) : windSuitability(lat, lng);
+          const color = heatRgba(value);
+          const offset = (y * canvas.width + x) * 4;
+          data[offset] = color[0];
+          data[offset + 1] = color[1];
+          data[offset + 2] = color[2];
+          data[offset + 3] = color[3];
+        }
+      }
+      ctx.putImageData(image, 0, 0);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    // Convert geographic coordinates into the globe's local Cartesian space.
+    // The negative z term matches Three.js SphereGeometry's equirectangular UV
+    // orientation, so labels and point meshes sit over the same longitudes as
+    // the Earth texture and heat textures. All globe-attached objects use this
+    // function: point meshes, label anchor projection, and the visibility test
+    // for whether a point is on the front side of the planet.
+    function globeLocalVector(lat, lng, radius = 1) {
+      const latRad = THREE.MathUtils.degToRad(lat);
+      const lngRad = THREE.MathUtils.degToRad(lng);
+      const cosLat = Math.cos(latRad);
+      return new THREE.Vector3(
+        radius * cosLat * Math.cos(lngRad),
+        radius * Math.sin(latRad),
+        -radius * cosLat * Math.sin(lngRad)
+      );
+    }
+
+    function initGlobe() {
+      if (globeState.initialized || !window.THREE) return;
+      // The globe uses one full-screen transparent WebGL canvas behind the HTML
+      // interface. Pixel ratio is capped to keep laptops responsive while still
+      // rendering crisp coastlines and heat overlays on high-DPI displays.
+      globeState.scene = new THREE.Scene();
+      globeState.camera = new THREE.PerspectiveCamera(38, window.innerWidth / window.innerHeight, 0.1, 100);
+      globeState.camera.position.set(0, 0, globeState.targetDistance);
+      globeState.renderer = new THREE.WebGLRenderer({ canvas: globeCanvas, antialias: true, alpha: true });
+      globeState.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      globeState.renderer.setSize(window.innerWidth, window.innerHeight, false);
+      globeState.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      globeState.scene.add(new THREE.AmbientLight(0xbfd7e6, 1.6));
+      const sun = new THREE.DirectionalLight(0xffffff, 2.1);
+      sun.position.set(4, 2.4, 5);
+      globeState.scene.add(sun);
+
+      // A single parent group holds the Earth, atmosphere, heat surfaces, and
+      // resource point meshes. Rotating this group keeps every globe-attached
+      // visual layer perfectly aligned during drag interactions.
+      globeState.group = new THREE.Group();
+      globeState.group.rotation.y = globeState.targetYaw;
+      globeState.scene.add(globeState.group);
+
+      // Start with the local procedural texture so the sphere is visible on the
+      // first frame. The network texture is optional and only improves visual
+      // fidelity; failure to load it should not break the application.
+      const sphere = new THREE.SphereGeometry(1, 96, 64);
+      const earthMaterial = new THREE.MeshStandardMaterial({
+        map: createFallbackEarthTexture(),
+        roughness: 0.82,
+        metalness: 0.02
+      });
+      const earth = new THREE.Mesh(sphere, earthMaterial);
+      globeState.group.add(earth);
+      const loader = new THREE.TextureLoader();
+      loader.setCrossOrigin("anonymous");
+      loader.load(
+        "https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg",
+        texture => {
+          texture.colorSpace = THREE.SRGBColorSpace;
+          texture.anisotropy = globeState.renderer.capabilities.getMaxAnisotropy();
+          earthMaterial.map = texture;
+          earthMaterial.needsUpdate = true;
+          applyDetailedEarthTexture(earthMaterial);
+        },
+        undefined,
+        () => applyDetailedEarthTexture(earthMaterial)
+      );
+
+      // The atmosphere mesh is slightly larger than the Earth and transparent.
+      // It gives the 3D mode depth without interfering with heat-map colors or
+      // point picking, because all interaction is handled by the HTML overlay.
+      const atmosphere = new THREE.Mesh(
+        new THREE.SphereGeometry(1.018, 96, 64),
+        new THREE.MeshBasicMaterial({ color: 0x8bd7ff, transparent: true, opacity: 0.16, depthWrite: false })
+      );
+      globeState.group.add(atmosphere);
+
+      // Wind and solar overlays are separate meshes just above the Earth. They
+      // are toggled like normal layers, so the energy mode controls can reuse
+      // the same logic as the flat map while the renderer remains Three.js.
+      const heatGeometry = new THREE.SphereGeometry(1.021, 96, 64);
+      globeState.heatWind = new THREE.Mesh(
+        heatGeometry,
+        new THREE.MeshBasicMaterial({ map: createGlobeHeatTexture("wind"), transparent: true, depthWrite: false, opacity: 0.92 })
+      );
+      globeState.heatSolar = new THREE.Mesh(
+        heatGeometry.clone(),
+        new THREE.MeshBasicMaterial({ map: createGlobeHeatTexture("solar"), transparent: true, depthWrite: false, opacity: 0.92 })
+      );
+      globeState.group.add(globeState.heatWind);
+      globeState.group.add(globeState.heatSolar);
+
+      globeState.pointGroup = new THREE.Group();
+      globeState.group.add(globeState.pointGroup);
+
+      // Dragging and wheel zoom update target values only. The animation loop
+      // interpolates toward those targets, which is what gives the globe a
+      // Google-Earth-like smooth movement instead of abrupt camera jumps.
+      globeCanvas.addEventListener("pointerdown", event => {
+        globeState.pointerDown = true;
+        globeState.lastPointer = { x: event.clientX, y: event.clientY };
+        globeCanvas.setPointerCapture(event.pointerId);
+      });
+      globeCanvas.addEventListener("pointermove", event => {
+        if (!globeState.pointerDown) return;
+        const dx = event.clientX - globeState.lastPointer.x;
+        const dy = event.clientY - globeState.lastPointer.y;
+        globeState.lastPointer = { x: event.clientX, y: event.clientY };
+        globeState.targetYaw += dx * 0.006;
+        globeState.targetPitch = Math.max(-1.18, Math.min(1.18, globeState.targetPitch + dy * 0.006));
+      });
+      window.addEventListener("pointerup", () => {
+        globeState.pointerDown = false;
+      });
+      globeCanvas.addEventListener("wheel", event => {
+        if (currentMapStyle !== "globe") return;
+        event.preventDefault();
+        globeState.targetDistance = Math.max(1.7, Math.min(4.4, globeState.targetDistance + event.deltaY * 0.0026));
+        syncZoomSlider();
+      }, { passive: false });
+
+      globeState.initialized = true;
+      resizeGlobe();
+      renderGlobePoints();
+      startGlobeAnimation();
+    }
+
+    // Smooth-render loop for the 3D view. Interpolation decouples user input
+    // events from frame rendering, so quick wheel or drag gestures become a
+    // continuous camera movement. The HTML labels and frosted detail panel are
+    // reprojected every frame because their screen positions depend on the
+    // camera and globe rotation.
+    function startGlobeAnimation() {
+      if (globeState.animating || !globeState.initialized) return;
+      globeState.animating = true;
+      const animate = () => {
+        if (!globeState.animating) return;
+        requestAnimationFrame(animate);
+        globeState.group.rotation.y += (globeState.targetYaw - globeState.group.rotation.y) * 0.12;
+        globeState.group.rotation.x += (globeState.targetPitch - globeState.group.rotation.x) * 0.12;
+        globeState.camera.position.z += (globeState.targetDistance - globeState.camera.position.z) * 0.14;
+        globeState.camera.lookAt(0, 0, 0);
+        globeState.renderer.render(globeState.scene, globeState.camera);
+        renderGlobeAnnotations();
+        if (currentMapStyle === "globe") positionResourceInfoPanel();
+      };
+      animate();
+    }
+
+    function resizeGlobe() {
+      if (!globeState.initialized) return;
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      globeState.camera.aspect = width / height;
+      globeState.camera.updateProjectionMatrix();
+      globeState.renderer.setSize(width, height, false);
+    }
+
+    // Resource point meshes are recreated when the active energy mode changes.
+    // Disposing geometries/materials avoids accumulating GPU memory after many
+    // filter switches during a long browser session.
+    function clearGlobePoints() {
+      if (!globeState.pointGroup) return;
+      while (globeState.pointGroup.children.length) {
+        const child = globeState.pointGroup.children.pop();
+        child.geometry?.dispose();
+        child.material?.dispose();
+      }
+    }
+
+    // Globe mode always renders the active point anchors. Wind and solar keep
+    // their continuous heat surfaces visible behind these anchors so the user
+    // can read both the broad resource pattern and the shortlist centroids.
+    function renderGlobePoints() {
+      if (!globeState.initialized) return;
+      clearGlobePoints();
+      const modes = activeEnergyModes();
+      globeState.heatWind.visible = markerMode !== "all" && modes.includes("wind");
+      globeState.heatSolar.visible = markerMode !== "all" && modes.includes("solar");
+      currentFeatures().forEach(feature => {
+        const dot = new THREE.Mesh(
+          new THREE.SphereGeometry(0.012, 16, 10),
+          new THREE.MeshBasicMaterial({ color: ENERGY_COLORS[feature.energy] })
+        );
+        dot.position.copy(globeLocalVector(feature.lat, feature.lon, 1.035));
+        globeState.pointGroup.add(dot);
+      });
+    }
+
+    // Project a geographic feature through the current 3D camera into screen
+    // coordinates for HTML labels. The dot-product test suppresses labels on
+    // the far side of the globe, which prevents annotations from floating over
+    // invisible resources.
+    function globeFeatureScreenPoint(feature) {
+      if (!globeState.initialized) return null;
+      const world = globeLocalVector(feature.lat, feature.lon, 1.04);
+      globeState.group.localToWorld(world);
+      const cameraNormal = globeState.camera.position.clone().normalize();
+      if (world.clone().normalize().dot(cameraNormal) < 0.04) return null;
+      const projected = world.project(globeState.camera);
+      return {
+        x: (projected.x * 0.5 + 0.5) * window.innerWidth,
+        y: (-projected.y * 0.5 + 0.5) * window.innerHeight
+      };
+    }
+
+    // Render globe annotations as regular HTML and SVG on top of the WebGL
+    // canvas. This keeps labels sharp, accessible, and clickable while the
+    // expensive Earth rendering stays inside Three.js. The labels are rebuilt
+    // every animation frame because their anchor positions change as the globe
+    // rotates or zooms.
+    function renderGlobeAnnotations() {
+      globeLineLayer.replaceChildren();
+      globeMarkerLayer.replaceChildren();
+      globeLineLayer.setAttribute("width", String(window.innerWidth));
+      globeLineLayer.setAttribute("height", String(window.innerHeight));
+      globeLineLayer.setAttribute("viewBox", `0 0 ${window.innerWidth} ${window.innerHeight}`);
+      if (currentMapStyle !== "globe") return;
+      const labelWidth = 168;
+      const labelHeight = 56;
+      const margin = 14;
+      const placedRects = [];
+      const labelLimit = activeMode === "all" ? 18 : 12;
+      let renderedLabels = 0;
+      const overlapsPlacedLabel = rect => placedRects.some(placed =>
+        !(rect.x + rect.w < placed.x || rect.x > placed.x + placed.w || rect.y + rect.h < placed.y || rect.y > placed.y + placed.h)
+      );
+      // Prioritize the selected feature first, then resources near the center
+      // of the screen. This keeps the visible globe readable in "All markers"
+      // mode, where showing every valid point would quickly create label piles.
+      const candidates = currentFeatures()
+        .map(feature => ({ feature, point: globeFeatureScreenPoint(feature) }))
+        .filter(candidate => candidate.point)
+        .sort((a, b) => {
+          const aSelected = a.feature.name === selectedFeatureName ? -1 : 0;
+          const bSelected = b.feature.name === selectedFeatureName ? -1 : 0;
+          if (aSelected !== bSelected) return aSelected - bSelected;
+          const aCenterDistance = Math.abs(a.point.x - window.innerWidth / 2) + Math.abs(a.point.y - window.innerHeight / 2);
+          const bCenterDistance = Math.abs(b.point.x - window.innerWidth / 2) + Math.abs(b.point.y - window.innerHeight / 2);
+          return aCenterDistance - bCenterDistance;
+        });
+      candidates.forEach(({ feature, point }) => {
+        const color = ENERGY_COLORS[feature.energy];
+        const rawLabelX = point.x + feature.offset[0];
+        const rawLabelY = point.y + feature.offset[1];
+        const labelX = clamp(rawLabelX, margin, window.innerWidth - labelWidth - margin);
+        const labelY = clamp(rawLabelY, margin + labelHeight / 2, window.innerHeight - labelHeight / 2 - margin);
+
+        const dot = document.createElement("div");
+        dot.className = "html-resource-dot";
+        dot.style.setProperty("--color", color);
+        dot.style.left = `${point.x}px`;
+        dot.style.top = `${point.y}px`;
+        dot.title = localizedFeatureTitle(feature);
+        dot.setAttribute("role", "button");
+        dot.setAttribute("aria-label", localizedFeatureTitle(feature));
+        dot.tabIndex = 0;
+        attachFeatureSelectionHandlers(dot, feature);
+        globeMarkerLayer.append(dot);
+
+        if (labelsHidden) return;
+
+        const labelRect = { x: labelX, y: labelY - labelHeight / 2, w: labelWidth, h: labelHeight };
+        const selected = feature.name === selectedFeatureName;
+        // The selected resource is always allowed through the collision filter
+        // so the user's click target remains visible after the globe settles.
+        if (!selected && (renderedLabels >= labelLimit || overlapsPlacedLabel(labelRect))) return;
+        placedRects.push(labelRect);
+        renderedLabels += 1;
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", point.x.toFixed(1));
+        line.setAttribute("y1", point.y.toFixed(1));
+        line.setAttribute("x2", labelX.toFixed(1));
+        line.setAttribute("y2", labelY.toFixed(1));
+        line.setAttribute("stroke", color);
+        globeLineLayer.append(line);
+
+        const label = document.createElement("button");
+        label.type = "button";
+        label.className = "html-callout-label";
+        label.style.setProperty("--color", color);
+        label.style.left = `${labelX}px`;
+        label.style.top = `${labelY}px`;
+        label.innerHTML = `<b>${escapeHtml(localizedFeatureTitle(feature))}</b><span>${escapeHtml(localizedFeatureMetric(feature))}</span>`;
+        attachFeatureSelectionHandlers(label, feature);
+        globeMarkerLayer.append(label);
+      });
+    }
+
+    // These helpers mirror the flat map Home/Fit controls. They only change
+    // target camera values; the animation loop performs the visible motion.
+    function resetGlobeView() {
+      globeState.targetYaw = -Math.PI / 2;
+      globeState.targetPitch = 0;
+      globeState.targetDistance = 3.2;
+      syncZoomSlider();
+    }
+
+    function focusGlobeFeature(feature) {
+      globeState.targetYaw = -THREE.MathUtils.degToRad(feature.lon) - Math.PI / 2;
+      globeState.targetPitch = THREE.MathUtils.degToRad(feature.lat);
+      globeState.targetDistance = Math.min(globeState.targetDistance, 2.45);
+      syncZoomSlider();
+    }
+
+    // Switching map style is a renderer change, not a data change. Both views
+    // read the same APP_DATA payload, language state, selected layer, and active
+    // resource. This keeps flat and 3D modes consistent without duplicating the
+    // data-fetching pipeline.
+    function setMapStyle(style) {
+      currentMapStyle = style === "globe" ? "globe" : "flat";
+      mapStyleSelect.value = currentMapStyle;
+      document.body.classList.toggle("globe-mode", currentMapStyle === "globe");
+      globeScene.setAttribute("aria-hidden", String(currentMapStyle !== "globe"));
+      if (currentMapStyle === "globe") {
+        initGlobe();
+        renderGlobePoints();
+        renderGlobeAnnotations();
+      } else {
+        map.invalidateSize();
+        callouts.forEach(c => c.update());
+        scheduleAnnotationRender();
+      }
+      syncZoomSlider();
+      positionResourceInfoPanel();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function ui() {
+      return UI_TEXT[currentLanguage] || UI_TEXT.en;
+    }
+
+    function modeLabel(mode) {
+      return (MODE_LABELS[currentLanguage] && MODE_LABELS[currentLanguage][mode]) || MODE_LABELS.en[mode] || mode;
+    }
+
+    function localizedRegion(feature) {
+      if (currentLanguage === "zh") return ZH_REGION_TRANSLATIONS[feature.region] || feature.region;
+      return feature.region;
+    }
+
+    function localizedFeatureMetric(feature) {
+      if (currentLanguage === "zh") return ZH_METRIC_TRANSLATIONS[feature.metric] || feature.metric;
+      if (currentLanguage === "en") return feature.metric;
+      return `${modeLabel(feature.energy)} - ${ui().resourcePoints}`;
+    }
+
+    function localizedFeatureTitle(feature) {
+      if (feature.rasterCandidate && currentLanguage === "zh") {
+        return `${localizedRegion(feature)}${feature.energy === "solar" ? "光伏候选区" : "风电候选区"}`;
+      }
+      return currentLanguage === "en" ? feature.label : modeLabel(feature.energy);
+    }
+
+    function localizedFeatureDrivers(feature) {
+      if (currentLanguage === "zh") return ZH_DRIVER_TRANSLATIONS[feature.drivers] || feature.drivers;
+      if (currentLanguage === "en") return feature.drivers;
+      return feature.summary || feature.drivers;
+    }
+
+    function localizedFeatureSummary(feature) {
+      return feature.summary || `${feature.metric}. ${feature.drivers}`;
+    }
+
+    function localizedPointBrief(feature) {
+      const metric = localizedFeatureMetric(feature);
+      const drivers = localizedFeatureDrivers(feature);
+      if (currentLanguage === "zh") {
+        return `${feature.name} 位于${localizedRegion(feature)}，是${metric}，可作为${modeLabel(feature.energy)}资源适宜性筛选的参考点。主要开发判断依据包括：${drivers}`;
+      }
+      if (currentLanguage === "en") {
+        const summary = localizedFeatureSummary(feature);
+        return summary || `${feature.name} is a ${feature.metric.toLowerCase()} in ${feature.region}. ${feature.drivers}`;
+      }
+      return `${feature.name}: ${metric}. ${drivers}`;
+    }
+
+    function localizedEnergyInfo(mode) {
+      const base = APP_DATA.energyInfo[mode];
+      const zh = currentLanguage === "zh" ? ZH_ENERGY_COPY[mode] : null;
+      if (currentLanguage !== "en" && currentLanguage !== "zh") {
+        const copy = ui();
+        return {
+          name: modeLabel(mode),
+          summary: mode === "wind" || mode === "solar" ? copy.rasterLegend : copy.publicMarkers,
+          criteria: [copy.resourceSignal, copy.suitabilityDrivers, copy.sourceSummary, copy.sourcePage]
+        };
+      }
+      return {
+        name: modeLabel(mode),
+        summary: zh?.summary || base.summary,
+        criteria: zh?.criteria || base.criteria
+      };
+    }
+
+    function applyLanguageText() {
+      const copy = ui();
+      document.documentElement.lang = copy.lang;
+      document.documentElement.dir = copy.dir;
+      brandKicker.textContent = copy.brandKicker;
+      languageLabel.textContent = copy.language;
+      mapStyleLabel.textContent = copy.mapStyle || UI_TEXT.en.mapStyle;
+      mapStyleSelect.options[0].textContent = copy.flatMap || UI_TEXT.en.flatMap;
+      mapStyleSelect.options[1].textContent = copy.globeMap || UI_TEXT.en.globeMap;
+      mapStyleSelect.setAttribute("aria-label", copy.mapStyle || UI_TEXT.en.mapStyle);
+      markerModeLabel.textContent = copy.markerMode || UI_TEXT.en.markerMode;
+      markerModeSelect.options[0].textContent = copy.markerModeAll || UI_TEXT.en.markerModeAll;
+      markerModeSelect.options[1].textContent = copy.markerModeSingle || UI_TEXT.en.markerModeSingle;
+      markerModeSelect.options[2].textContent = copy.markerModeMulti || UI_TEXT.en.markerModeMulti;
+      markerModeSelect.setAttribute("aria-label", copy.markerMode || UI_TEXT.en.markerMode);
+      appTitle.textContent = copy.appTitle;
+      appSubtitle.textContent = copy.appSubtitle;
+      aboutFooterTitle.textContent = currentLanguage === "en" ? copy.aboutMap : copy.sourceSummary;
+      sourcesFooterTitle.textContent = copy.sources || copy.source;
+      generatedBrief.textContent = APP_DATA.generatedAt;
+      criteriaPanelTitle.textContent = copy.screeningCriteria;
+      pointsPanelTitle.textContent = copy.resourcePoints;
+      generatedLabel.textContent = copy.generated;
+      legendTitle.textContent = copy.legend;
+      lowerRasterLabel.textContent = copy.lowerRaster;
+      higherRasterLabel.textContent = copy.higherRaster;
+      markerLegendLabel.textContent = copy.markerLegend;
+      rasterLegendLabel.textContent = copy.rasterLegend;
+      resetViewButton.textContent = copy.resetView;
+      resetViewButton.title = copy.resetTitle;
+      resetViewButton.setAttribute("aria-label", copy.resetTitle);
+      updateLabelToggleButton();
+      zoomSlider.setAttribute("aria-label", copy.zoomSlider || copy.mapZoom);
+      syncSidebarToggleText();
+      document.querySelectorAll("[data-mode-label]").forEach(label => {
+        label.textContent = modeLabel(label.dataset.modeLabel);
+      });
+      callouts.forEach(bundle => {
+        const html = popupHtml(bundle.feature);
+        bundle.dot.setPopupContent(html);
+      });
+      renderPanel();
+      updateResourceInfoPanel();
+      scheduleAnnotationRender();
+      renderGlobeAnnotations();
+    }
+
+    // The same detail markup is used by flat-map popups, globe labels, and the
+    // frosted-glass detail panel. Centralizing it is important for localization:
+    // switching languages can refresh one function and update every detail view
+    // consistently.
+    function popupHtml(feature) {
+      const copy = ui();
+      const brief = localizedPointBrief(feature);
+      const sourceLink = feature.source_url
+        ? `<a href="${escapeHtml(feature.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(currentLanguage === "en" ? (feature.source_title || copy.sourcePage) : copy.sourcePage)}</a>`
+        : escapeHtml(copy.fallbackCoordinates || UI_TEXT.en.fallbackCoordinates);
+      return `
+        <div class="popup-title">${escapeHtml(feature.name)}</div>
+        <div class="popup-meta">${escapeHtml(modeLabel(feature.energy))} &middot; ${escapeHtml(localizedRegion(feature))}</div>
+        <div class="popup-grid">
+          <div><b>${escapeHtml(copy.resourceBrief || UI_TEXT.en.resourceBrief)}</b><br>${escapeHtml(brief)}</div>
+          <div><b>${escapeHtml(copy.source)}</b><br>${sourceLink}</div>
+        </div>
+      `;
+    }
+
+    function flatFeatureScreenPoint(feature, zoomEvent = null) {
+      if (zoomEvent) {
+        const latlng = featureLatLng(feature);
+        return map.project(latlng, zoomEvent.zoom).subtract(map._getNewPixelOrigin(zoomEvent.center, zoomEvent.zoom));
+      }
+      return map.latLngToContainerPoint(featureLatLng(feature));
+    }
+
+    // The detail panel follows the active renderer. Flat mode uses Leaflet's
+    // projected container point; globe mode uses the Three.js camera projection.
+    // If a selected globe point rotates out of view, the fallback position keeps
+    // the panel visible instead of leaving it at a stale offscreen coordinate.
+    function resourceScreenPoint(feature) {
+      if (currentMapStyle === "globe") {
+        return globeFeatureScreenPoint(feature) || { x: window.innerWidth * 0.5, y: window.innerHeight * 0.42 };
+      }
+      return flatFeatureScreenPoint(feature);
+    }
+
+    // Keep the frosted-glass resource panel close to its anchor while clamping
+    // it inside the viewport. This prevents the panel from being clipped at the
+    // screen edge during high zoom, narrow windows, RTL layouts, and globe
+    // rotation.
+    function positionResourceInfoPanel() {
+      if (resourceInfoPanel.hidden || !selectedFeatureName) return;
+      const bundle = markerByName.get(selectedFeatureName);
+      if (!bundle) return;
+      const point = resourceScreenPoint(bundle.feature);
+      const width = resourceInfoPanel.offsetWidth || 420;
+      const height = resourceInfoPanel.offsetHeight || 260;
+      let x = point.x + 22;
+      let y = point.y + 22;
+      if (x + width > window.innerWidth - 18) x = point.x - width - 22;
+      if (y + height > window.innerHeight - 18) y = window.innerHeight - height - 18;
+      x = Math.max(18, Math.min(window.innerWidth - width - 18, x));
+      y = Math.max(18, Math.min(window.innerHeight - height - 18, y));
+      resourceInfoPanel.style.left = `${x}px`;
+      resourceInfoPanel.style.top = `${y}px`;
+    }
+
+    // The detailed resource view is a fixed overlay instead of a Leaflet popup.
+    // That makes it usable in both flat and 3D modes, gives the requested glass
+    // effect a consistent stacking context, and prevents native popups from
+    // being detached from custom HTML labels during animated zoom.
+    function showResourceInfoPanel(feature) {
+      selectedFeatureName = feature.name;
+      const copy = ui();
+      resourceInfoPanel.innerHTML = `
+        <button class="resource-info-close" type="button" aria-label="${escapeHtml(copy.close || UI_TEXT.en.close)}">×</button>
+        ${popupHtml(feature)}
+      `;
+      resourceInfoPanel.hidden = false;
+      resourceInfoPanel.querySelector(".resource-info-close").addEventListener("click", hideResourceInfoPanel);
+      positionResourceInfoPanel();
+    }
+
+    function hideResourceInfoPanel() {
+      selectedFeatureName = "";
+      resourceInfoPanel.hidden = true;
+      resourceInfoPanel.replaceChildren();
+    }
+
+    function updateResourceInfoPanel() {
+      if (!selectedFeatureName) return;
+      const bundle = markerByName.get(selectedFeatureName);
+      if (!bundle) return;
+      showResourceInfoPanel(bundle.feature);
+    }
+
+    function addAnnotatedPoint(feature) {
+      const color = ENERGY_COLORS[feature.energy];
+      if (!groups[feature.energy]) groups[feature.energy] = L.layerGroup();
+      if (!groups.all) groups.all = L.layerGroup();
+
+      const latlng = L.latLng(feature.lat, feature.lon);
+      const dotIcon = L.divIcon({
+        className: "",
+        html: `<div class="popup-anchor" style="--color:${color}"></div>`,
+        iconSize: [1, 1],
+        iconAnchor: [0, 0]
+      });
+      const dot = L.marker(latlng, {
+        icon: dotIcon,
+        pane: "calloutPane",
+        keyboard: true,
+        title: feature.name
+      }).bindPopup(popupHtml(feature));
+
+      const rowFocus = () => selectPoint(feature.name, false);
+      dot.on("click", rowFocus);
+
+      const update = () => {
+        dot.setLatLng(featureLatLng(feature));
+      };
+
+      const bundle = { feature, dot, update };
+      callouts.push(bundle);
+      markerByName.set(feature.name, bundle);
+      groups[feature.energy].addLayer(dot);
+      groups.all.addLayer(dot);
+      return bundle;
+    }
+
+    APP_DATA.points.forEach(addAnnotatedPoint);
+    Object.values(RASTER_REFERENCE_POINTS).flat().forEach(feature => {
+      markerByName.set(feature.name, {
+        feature,
+        dot: null,
+        update() {}
+      });
+    });
+
+    function currentFeatures() {
+      return activeEnergyModes().flatMap(modeFeatures);
+    }
+
+    // Flat-map labels are also rendered as custom HTML/SVG instead of ordinary
+    // Leaflet tooltips. That keeps the small dot, leader line, and rich label
+    // visually identical to globe mode and gives us full control over click
+    // behavior, language refreshes, and screen-edge culling.
+    function renderHtmlAnnotations(zoomEvent = null) {
+      const features = currentFeatures();
+      htmlLineLayer.replaceChildren();
+      htmlMarkerLayer.replaceChildren();
+      htmlLineLayer.setAttribute("width", String(window.innerWidth));
+      htmlLineLayer.setAttribute("height", String(window.innerHeight));
+      htmlLineLayer.setAttribute("viewBox", `0 0 ${window.innerWidth} ${window.innerHeight}`);
+      const labelWidth = 168;
+      const labelHeight = 56;
+      const placedRects = [];
+      const labelLimit = markerMode === "all" ? 28 : markerMode === "multi" ? 32 : 16;
+      let renderedLabels = 0;
+      const overlapsPlacedLabel = rect => placedRects.some(placed =>
+        !(rect.x + rect.w < placed.x || rect.x > placed.x + placed.w || rect.y + rect.h < placed.y || rect.y > placed.y + placed.h)
+      );
+      const screenFeatures = features
+        .map(feature => {
+          const latlng = featureLatLng(feature);
+          const point = zoomEvent
+            ? map.project(latlng, zoomEvent.zoom).subtract(map._getNewPixelOrigin(zoomEvent.center, zoomEvent.zoom))
+            : map.latLngToContainerPoint(latlng);
+          return { feature, point };
+        })
+        .sort((a, b) => {
+          const aSelected = a.feature.name === selectedFeatureName ? -1 : 0;
+          const bSelected = b.feature.name === selectedFeatureName ? -1 : 0;
+          if (aSelected !== bSelected) return aSelected - bSelected;
+          const aCenterDistance = Math.abs(a.point.x - window.innerWidth / 2) + Math.abs(a.point.y - window.innerHeight / 2);
+          const bCenterDistance = Math.abs(b.point.x - window.innerWidth / 2) + Math.abs(b.point.y - window.innerHeight / 2);
+          return aCenterDistance - bCenterDistance;
+        });
+
+      screenFeatures.forEach(({ feature, point }) => {
+        const color = ENERGY_COLORS[feature.energy];
+        const rawLabelX = point.x + feature.offset[0];
+        const rawLabelY = point.y + feature.offset[1];
+        const labelX = clamp(rawLabelX, 14, window.innerWidth - labelWidth - 14);
+        const labelY = clamp(rawLabelY, 14 + labelHeight / 2, window.innerHeight - labelHeight / 2 - 14);
+        const margin = 220;
+        if (
+          point.x < -margin || point.x > window.innerWidth + margin ||
+          point.y < -margin || point.y > window.innerHeight + margin
+        ) {
+          return;
+        }
+
+        const dot = document.createElement("div");
+        dot.className = "html-resource-dot";
+        dot.style.setProperty("--color", color);
+        dot.style.left = `${point.x}px`;
+        dot.style.top = `${point.y}px`;
+        dot.title = localizedFeatureTitle(feature);
+        dot.setAttribute("role", "button");
+        dot.setAttribute("aria-label", localizedFeatureTitle(feature));
+        dot.tabIndex = 0;
+        attachFeatureSelectionHandlers(dot, feature);
+        htmlMarkerLayer.append(dot);
+
+        if (labelsHidden) return;
+        const labelRect = { x: labelX, y: labelY - labelHeight / 2, w: labelWidth, h: labelHeight };
+        const selected = feature.name === selectedFeatureName;
+        if (!selected && (renderedLabels >= labelLimit || overlapsPlacedLabel(labelRect))) return;
+        placedRects.push(labelRect);
+        renderedLabels += 1;
+
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", point.x.toFixed(1));
+        line.setAttribute("y1", point.y.toFixed(1));
+        line.setAttribute("x2", labelX.toFixed(1));
+        line.setAttribute("y2", labelY.toFixed(1));
+        line.setAttribute("stroke", color);
+        htmlLineLayer.append(line);
+
+        const label = document.createElement("button");
+        label.type = "button";
+        label.className = "html-callout-label";
+        label.style.setProperty("--color", color);
+        label.style.left = `${labelX}px`;
+        label.style.top = `${labelY}px`;
+        label.innerHTML = `<b>${escapeHtml(localizedFeatureTitle(feature))}</b><span>${escapeHtml(localizedFeatureMetric(feature))}</span>`;
+        attachFeatureSelectionHandlers(label, feature);
+        htmlMarkerLayer.append(label);
+      });
+    }
+
+    function syncModeButtons() {
+      document.querySelectorAll("[data-mode]").forEach(button => {
+        const mode = button.dataset.mode;
+        const active = markerMode === "all" ? true : markerMode === "multi" ? selectedModes.has(mode) : activeMode === mode;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+    }
+
+    function refreshLayerVisibility() {
+      activePointName = "";
+      hideResourceInfoPanel();
+      const modes = activeEnergyModes();
+      syncModeButtons();
+
+      Object.entries(heatLayers).forEach(([key, layer]) => {
+        if (markerMode !== "all" && modes.includes(key)) {
+          if (!map.hasLayer(layer)) layer.addTo(map);
+        } else {
+          if (map.hasLayer(layer)) map.removeLayer(layer);
+        }
+      });
+
+      Object.entries(groups).forEach(([key, group]) => {
+        if (map.hasLayer(group)) map.removeLayer(group);
+        if (markerMode === "all" && key === "all") group.addTo(map);
+        if (markerMode !== "all" && MARKER_POINT_MODES.has(key) && modes.includes(key)) group.addTo(map);
+      });
+
+      renderPanel();
+      renderGlobePoints();
+      setTimeout(() => {
+        callouts.forEach(c => c.update());
+        scheduleAnnotationRender();
+        renderGlobeAnnotations();
+      }, 0);
+    }
+
+    // Mode changes coordinate every layer family: Leaflet heat tiles, Leaflet
+    // marker groups, custom flat labels, Three.js globe heat meshes, globe point
+    // meshes, sidebar panels, and the floating title. Keeping this as the single
+    // switchboard prevents flat and 3D modes from drifting apart.
+    function setMode(mode) {
+      if (!ENERGY_ORDER.includes(mode)) return;
+      if (markerMode === "all") {
+        markerMode = "single";
+        markerModeSelect.value = markerMode;
+      }
+      if (markerMode === "multi") {
+        if (selectedModes.has(mode)) {
+          selectedModes.delete(mode);
+          if (!selectedModes.size) selectedModes.add(mode);
+        } else {
+          selectedModes.add(mode);
+        }
+        activeMode = "multi";
+      } else {
+        activeMode = mode;
+        selectedModes = new Set([mode]);
+      }
+      refreshLayerVisibility();
+    }
+
+    function setMarkerMode(nextMode) {
+      markerMode = nextMode === "single" || nextMode === "multi" ? nextMode : "all";
+      markerModeSelect.value = markerMode;
+      if (markerMode === "all") {
+        activeMode = "all";
+        selectedModes = new Set(ENERGY_ORDER);
+      } else if (markerMode === "single") {
+        const firstMode = activeMode !== "all" && activeMode !== "multi" ? activeMode : "coal";
+        activeMode = firstMode;
+        selectedModes = new Set([firstMode]);
+      } else {
+        if (!selectedModes.size || activeMode === "all") selectedModes = new Set(["coal", "oil", "gas", "nuclear"]);
+        activeMode = "multi";
+      }
+      refreshLayerVisibility();
+    }
+
+    function renderPanel() {
+      const copy = ui();
+      const currentPanelMode = panelMode();
+      const info = localizedEnergyInfo(currentPanelMode);
+      const features = currentFeatures();
+      const layer = markerMode === "single" ? APP_DATA.layers[activeMode] : null;
+
+      floatingTitle.textContent = info.name;
+      floatingSubtitle.textContent = layer ? info.summary : copy.publicMarkers;
+      activeSource.textContent = layer ? `${copy.source}: ${info.name}` : `${copy.source}: ${copy.sourcePublic}`;
+      criteriaPanelValue.textContent = `${info.criteria.length} ${copy.factorCount}`;
+      pointsPanelValue.textContent = `${features.length} ${copy.lowerPointCount}`;
+
+      criteriaList.replaceChildren(...info.criteria.map(item => {
+        const li = document.createElement("li");
+        li.textContent = item;
+        return li;
+      }));
+
+      pointList.replaceChildren(...features.map(feature => {
+        const li = document.createElement("li");
+        li.className = `point-item${feature.name === activePointName ? " active" : ""}`;
+        li.innerHTML = `
+          <div class="point-title">${escapeHtml(feature.name)} <span class="badge">${escapeHtml(feature.region)}</span></div>
+          <div class="point-meta">${escapeHtml(localizedFeatureMetric(feature))}</div>
+          <div class="point-drivers">${escapeHtml(localizedFeatureDrivers(feature))}</div>
+        `;
+        li.addEventListener("click", () => selectPoint(feature.name, true));
+        return li;
+      }));
+      renderProfessionalPanels();
+    }
+
+    function selectPoint(name, fly) {
+      activePointName = name;
+      const bundle = markerByName.get(name);
+      if (!bundle) return;
+      if (!featureVisible(bundle.feature)) {
+        markerMode = "single";
+        markerModeSelect.value = markerMode;
+        activeMode = bundle.feature.energy;
+        selectedModes = new Set([bundle.feature.energy]);
+        refreshLayerVisibility();
+        activePointName = name;
+      }
+      bundle.update();
+      if (fly) {
+        if (currentMapStyle === "globe") {
+          focusGlobeFeature(bundle.feature);
+        } else {
+          const target = featureLatLng(bundle.feature);
+          map.flyTo(target, Math.max(map.getZoom(), 5), { duration: 0.65, easeLinearity: 0.22 });
+        }
+      }
+      showResourceInfoPanel(bundle.feature);
+      renderPanel();
+      scheduleAnnotationRender();
+      renderGlobeAnnotations();
+    }
+
+    function toggleLabels() {
+      labelsHidden = !labelsHidden;
+      updateLabelToggleButton();
+      renderHtmlAnnotations();
+      renderGlobeAnnotations();
+    }
+
+    document.querySelectorAll("[data-mode]").forEach(button => {
+      button.addEventListener("click", () => setMode(button.dataset.mode));
+    });
+
+    markerModeSelect.addEventListener("change", () => {
+      setMarkerMode(markerModeSelect.value);
+    });
+
+    weightInputs.forEach(input => {
+      input.addEventListener("input", () => {
+        screeningWeights[input.dataset.weight] = Number(input.value);
+        renderProfessionalPanels();
+      });
+    });
+
+    exportCsvButton.addEventListener("click", exportScreeningCsv);
+    exportGeojsonButton.addEventListener("click", exportScreeningGeojson);
+    exportReportButton.addEventListener("click", exportScreeningReport);
+
+    resetViewButton.addEventListener("click", () => {
+      if (currentMapStyle === "globe") {
+        resetGlobeView();
+      } else {
+        map.setView([15, 0], 3, { animate: true });
+      }
+    });
+
+    labelToggleButton.addEventListener("click", toggleLabels);
+
+    sidebarToggle.addEventListener("click", () => {
+      document.body.classList.toggle("sidebar-collapsed");
+      syncSidebarToggleText();
+      setTimeout(() => {
+        map.invalidateSize();
+        resizeGlobe();
+        callouts.forEach(c => c.update());
+        scheduleAnnotationRender();
+        renderGlobeAnnotations();
+        positionResourceInfoPanel();
+      }, 210);
+    });
+
+    zoomSlider.addEventListener("input", () => {
+      if (currentMapStyle === "globe") {
+        globeState.targetDistance = globeZoomToDistance(Number(zoomSlider.value));
+      } else {
+        applyFlatZoom(Number(zoomSlider.value));
+      }
+      syncZoomSlider();
+      scheduleAnnotationRender();
+    });
+
+    map.on("move zoom", () => {
+      callouts.forEach(c => c.update());
+      scheduleAnnotationRender();
+      positionResourceInfoPanel();
+    });
+
+    map.on("zoomend moveend", () => {
+      syncZoomSlider();
+      callouts.forEach(c => c.update());
+      scheduleAnnotationRender();
+      positionResourceInfoPanel();
+    });
+
+    map.on("mousemove", event => {
+      const copy = ui();
+      const lng = ((event.latlng.lng + 540) % 360) - 180;
+      cursorPosition.textContent = `${copy.lat} ${event.latlng.lat.toFixed(3)}, ${copy.lon} ${lng.toFixed(3)}`;
+    });
+
+    map.getContainer().addEventListener("wheel", handleFlatWheelZoom, { passive: false });
+
+    generatedAt.textContent = APP_DATA.generatedAt;
+    generatedBrief.textContent = APP_DATA.generatedAt;
+    sourceList.replaceChildren(...APP_DATA.sources.map(source => {
+      const li = document.createElement("li");
+      li.innerHTML = `<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(source.name)}</a>`;
+      return li;
+    }));
+
+    languageSelect.addEventListener("change", () => {
+      currentLanguage = languageSelect.value;
+      applyLanguageText();
+    });
+
+    mapStyleSelect.addEventListener("change", () => {
+      setMapStyle(mapStyleSelect.value);
+    });
+
+    const startupParams = new URLSearchParams(window.location.search);
+    const startupLanguage = startupParams.get("lang");
+    const startupMode = startupParams.get("mode");
+    const startupPoint = startupParams.get("point");
+    const startupStyle = startupParams.get("style");
+    if (startupLanguage && UI_TEXT[startupLanguage]) {
+      currentLanguage = startupLanguage;
+      languageSelect.value = startupLanguage;
+    }
+    setMapStyle(startupStyle === "globe" ? "globe" : "flat");
+    if (startupMode && ENERGY_ORDER.includes(startupMode)) {
+      setMode(startupMode);
+    } else {
+      setMarkerMode("all");
+    }
+    applyLanguageText();
+    map.whenReady(() => {
+      map.invalidateSize();
+      map.setView([15, 0], 3, { animate: false });
+      syncZoomSlider();
+      callouts.forEach(c => c.update());
+      scheduleAnnotationRender();
+      if (startupPoint && markerByName.has(startupPoint)) {
+        selectPoint(startupPoint, false);
+      }
+    });
+    window.addEventListener("resize", () => {
+      map.invalidateSize();
+      resizeGlobe();
+      callouts.forEach(c => c.update());
+      scheduleAnnotationRender();
+      renderGlobeAnnotations();
+      positionResourceInfoPanel();
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def fetch_json(url: str, params: dict[str, Any] | None = None, timeout: int = 20) -> dict[str, Any]:
+    """Fetch JSON from a public HTTP endpoint with a consistent user agent.
+
+    The generator deliberately avoids third-party Python dependencies so it can
+    run on a fresh local machine. urllib is enough for ArcGIS REST endpoints and
+    the MediaWiki API, and keeping this helper small makes network failures easy
+    to reason about.
+    """
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def compact_text(value: str, limit: int = 220) -> str:
+    """Collapse whitespace and trim long source descriptions for UI display."""
+    value = " ".join((value or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rsplit(" ", 1)[0] + "..."
+
+
+def strip_html_tags(value: str) -> str:
+    """Convert simple HTML metadata fields into safe, compact plain text.
+
+    ArcGIS item descriptions often contain small HTML snippets. The generated
+    app renders metadata inside its own layout, so retaining those tags would
+    either display raw markup or create inconsistent formatting.
+    """
+    value = re.sub(r"<br\s*/?>", " ", value or "", flags=re.IGNORECASE)
+    value = re.sub(r"</p\s*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", " ", value)
+    return html.unescape(value)
+
+
+def fetch_arcgis_layer(kind: str, config: dict[str, str]) -> dict[str, Any]:
+    """Resolve an ArcGIS Living Atlas item into a Leaflet tile-layer config.
+
+    Wind and solar suitability are best represented as continuous surfaces.
+    ArcGIS image services expose cached tiles in the same z/y/x pattern Leaflet
+    can consume, so this helper records the service URL plus the native maximum
+    level of detail. The HTML then lets users zoom beyond that native level while
+    Leaflet reuses the best available raster tiles instead of requesting missing
+    tiles.
+    """
+    item_url = f"https://www.arcgis.com/home/item.html?id={config['id']}"
+    try:
+        item = fetch_json(
+            f"https://www.arcgis.com/sharing/rest/content/items/{config['id']}",
+            {"f": "json"},
+        )
+        service_url = item.get("url") or config["fallback_url"]
+        metadata = fetch_json(service_url, {"f": "json"})
+        lods = metadata.get("tileInfo", {}).get("lods") or []
+        levels = [lod.get("level") for lod in lods if isinstance(lod.get("level"), int)]
+        max_level = max(levels) if levels else config["fallback_max_level"]
+        source_note = compact_text(strip_html_tags(item.get("description") or item.get("snippet") or ""), 190)
+        return {
+            "kind": kind,
+            "id": config["id"],
+            "label": item.get("title") or config["label"],
+            "tileUrl": service_url.rstrip("/"),
+            "itemUrl": item_url,
+            "unit": config["unit"],
+            "sourceNote": source_note or config["label"],
+            "attribution": f"{config['label']}: World Bank / ESMAP / ArcGIS Living Atlas",
+            "fetched": True,
+            "modified": item.get("modified"),
+            "tileInfo": bool(metadata.get("tileInfo")),
+            "maxLevel": max_level,
+        }
+    except Exception as exc:
+        # Network restrictions should not prevent the local HTML from being
+        # generated. If metadata lookup fails, keep a known service URL and
+        # surface the failure inside the layer note for transparency.
+        return {
+            "kind": kind,
+            "id": config["id"],
+            "label": config["label"],
+            "tileUrl": config["fallback_url"],
+            "itemUrl": item_url,
+            "unit": config["unit"],
+            "sourceNote": f"Fallback service URL used because metadata fetch failed: {exc}",
+            "attribution": f"{config['label']}: World Bank / ESMAP / ArcGIS Living Atlas",
+            "fetched": False,
+            "modified": None,
+            "tileInfo": False,
+            "maxLevel": config["fallback_max_level"],
+        }
+
+
+def fetch_wikipedia_point(point: ResourcePoint) -> ResourcePoint:
+    """Enrich one curated resource point with public coordinate metadata.
+
+    Wikipedia is used here as a pragmatic open coordinate index, not as a
+    technical authority for reserve estimates. The curated metric/drivers fields
+    remain the energy-screening interpretation; the API result contributes a
+    canonical URL, a short source summary, and a coordinate when available.
+    """
+    params = {
+        "action": "query",
+        "format": "json",
+        "formatversion": "2",
+        "prop": "coordinates|extracts|info",
+        "inprop": "url",
+        "exintro": "1",
+        "explaintext": "1",
+        "coprop": "type|dim|region",
+        "titles": point.wiki_title,
+        "redirects": "1",
+    }
+    try:
+        data = fetch_json("https://en.wikipedia.org/w/api.php", params)
+        pages = data.get("query", {}).get("pages", [])
+        if not pages or pages[0].get("missing"):
+            return point
+        page = pages[0]
+        coords = page.get("coordinates") or []
+        if coords:
+            point.lat = float(coords[0].get("lat", point.lat))
+            point.lon = float(coords[0].get("lon", point.lon))
+        point.source_url = page.get("fullurl") or f"https://en.wikipedia.org/wiki/{urllib.parse.quote(point.wiki_title.replace(' ', '_'))}"
+        point.source_title = page.get("title") or point.wiki_title
+        point.summary = compact_text(page.get("extract") or "", 260)
+        point.fetched = bool(coords or point.summary)
+        return point
+    except Exception:
+        # Fallbacks are intentionally explicit. The generated map should still
+        # show the point, but the UI will not count it as web-fetched.
+        point.source_url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(point.wiki_title.replace(' ', '_'))}"
+        point.source_title = point.wiki_title
+        return point
+
+
+def build_app_data() -> dict[str, Any]:
+    """Build the complete JSON payload embedded into the generated HTML.
+
+    Keeping the payload as structured JSON rather than hard-coded JavaScript
+    makes it much easier to swap in higher-resolution GeoJSON, vector tiles, or
+    local datasets later. The HTML template only needs to know how to render the
+    data contract produced here.
+    """
+    layers = {kind: fetch_arcgis_layer(kind, config) for kind, config in ARCGIS_ITEMS.items()}
+    points = [fetch_wikipedia_point(point) for point in RESOURCE_POINTS]
+    generated = dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    return {
+        "generatedAt": generated,
+        "layers": layers,
+        "points": [asdict(point) for point in points],
+        "energyInfo": ENERGY_INFO,
+        # Methodology metadata is embedded with the UI so every generated report
+        # can explain what the score is, which factors it used, and where the
+        # model stops. This is deliberately conservative: it supports early
+        # consulting triage and client discussion, not bankable feasibility.
+        "screeningModel": {
+            "version": "pre-consulting-screening-v1",
+            "intendedUse": "Early-stage consulting shortlist and comparative screening only; not a feasibility study, reserve estimate, or engineering design model.",
+            "factors": [
+                {
+                    "key": "resource",
+                    "label": "Resource signal",
+                    "description": "Relative strength of public resource signal or atlas-derived suitability surface.",
+                },
+                {
+                    "key": "infrastructure",
+                    "label": "Access",
+                    "description": "Heuristic access proxy using public descriptions, latitude band and infrastructure keywords such as grid, port, rail, pipeline or demand.",
+                },
+                {
+                    "key": "terrain",
+                    "label": "Terrain / geology",
+                    "description": "High-level terrain or geological setting proxy for early comparison.",
+                },
+                {
+                    "key": "constraint",
+                    "label": "Constraints",
+                    "description": "Higher value means fewer visible early constraints; text-risk keywords lower the score.",
+                },
+            ],
+            "defaultWeights": {
+                "resource": 45,
+                "infrastructure": 20,
+                "terrain": 20,
+                "constraint": 15,
+            },
+            "limitations": [
+                "Uses public point anchors and browser-side suitability surfaces.",
+                "Does not replace licensed resource rasters, protected-area layers, land tenure, grid capacity, hydrology, permitting, geotechnical or economic analysis.",
+                "Exports are intended for traceable shortlist discussion and handoff to GIS/engineering workflows.",
+            ],
+        },
+        "sources": [
+            {
+                "name": "Global Wind Atlas via ArcGIS Living Atlas",
+                "url": layers["wind"]["itemUrl"],
+            },
+            {
+                "name": "Global Solar Atlas via ArcGIS Living Atlas",
+                "url": layers["solar"]["itemUrl"],
+            },
+            {
+                "name": "Wikipedia API public coordinate and summary data",
+                "url": "https://www.mediawiki.org/wiki/API:Main_page",
+            },
+            {
+                "name": "Esri World Street Map basemap",
+                "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer",
+            },
+            {
+                "name": "CARTO Voyager / OpenStreetMap fallback basemap",
+                "url": "https://carto.com/basemaps/",
+            },
+        ],
+    }
+
+
+def render_html(app_data: dict[str, Any]) -> str:
+    """Inject the structured payload into the static HTML application shell."""
+    payload = json.dumps(app_data, ensure_ascii=False, indent=2)
+    return HTML_TEMPLATE.replace("__APP_DATA__", payload)
+
+
+def main() -> None:
+    """Entry point used by the user: fetch data, render HTML, print a summary."""
+    app_data = build_app_data()
+    html_text = render_html(app_data)
+    OUTPUT_HTML.write_text(html_text, encoding="utf-8")
+    fetched_points = sum(1 for point in app_data["points"] if point["fetched"])
+    fetched_layers = sum(1 for layer in app_data["layers"].values() if layer["fetched"])
+    print(
+        textwrap.dedent(
+            f"""
+            Generated {OUTPUT_HTML}
+            Points: {len(app_data['points'])} ({fetched_points} fetched from web)
+            Raster layers: {fetched_layers}/{len(app_data['layers'])} metadata fetched
+            """
+        ).strip()
+    )
+
+
+if __name__ == "__main__":
+    main()
